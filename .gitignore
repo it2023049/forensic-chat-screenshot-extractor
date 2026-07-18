@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+myenv/
+
+# Generated outputs
+results/
+accuracy_results/
+results_full_patched/
+accuracy_full_patched/
+*_debug/
+*_extracted.csv
+*_merged_chats.csv
+*.manifest.json
+
+# Private/local data
+images/
+case_reports/
+ground_truth/
+*.pdf
+*.xlsx
+*.xlsm
+
+# Logs
+*.out
+*.err
+*.log
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
