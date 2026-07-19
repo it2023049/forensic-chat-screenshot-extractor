@@ -22,19 +22,22 @@ The final transcript format is:
 
 ## Repository contents
 
-| File | Purpose |
-|---|---|
-| `mass_chat_extract.py` | Main orchestration script. It receives a case report and image inputs, classifies each screenshot as Facebook Messenger or Viber, runs the correct extractor, and creates per-image CSVs plus a merged CSV. |
-| `facebook_extract.py` | Extracts messages from Facebook Messenger screenshots/collages. It uses OCR, crop splitting, OCR geometry, vision-model prompting, side mapping, cleanup rules, and CSV normalization. |
-| `viber_extract.py` | Extracts messages from Viber screenshots/collages. It uses OCR, Viber-specific bubble/time handling, side mapping, cleanup rules, and CSV normalization. |
+| File                   | Purpose                                                                                                                                                                                                           |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mass_chat_extract.py` | Main batch/orchestration script. It receives a case report and image inputs, classifies each screenshot as Facebook Messenger or Viber, runs the correct extractor, and creates per-image CSVs plus a merged CSV. |
+| `facebook_extract.py`  | Extracts messages from Facebook Messenger screenshots/collages. It uses OCR, crop splitting, OCR geometry, vision-model prompting, side mapping, cleanup rules, and CSV normalization.                            |
+| `viber_extract.py`     | Extracts messages from Viber screenshots/collages. It uses OCR, Viber-specific bubble/time handling, side mapping, cleanup rules, and CSV normalization.                                                          |
+| `extractor_utils.py`   | Shared helper module used by both platform extractors for common OCR, CSV, report, image, and text-processing utilities.                                                                                          |
+
+Keep `extractor_utils.py` in the same folder as `facebook_extract.py` and `viber_extract.py`, because both extractors import shared helpers from it.
 
 Recommended folders:
 
-| Folder | Purpose |
-|---|---|
-| `images/` | Input screenshots/collages. Can contain subfolders such as `facebook/` and `viber/`. |
-| `case_reports/` | PDF or TXT case reports used to identify participants and contact details. |
-| `results/` | Generated outputs. Created automatically by the pipeline. |
+| Folder          | Purpose                                                                              |
+| --------------- | ------------------------------------------------------------------------------------ |
+| `images/`       | Input screenshots/collages. Can contain subfolders such as `facebook/` and `viber/`. |
+| `case_reports/` | PDF or TXT case reports used to identify participants and contact details.           |
+| `results/`      | Generated outputs. Created automatically by the pipeline.                            |
 
 Private datasets, screenshots, case reports, and generated transcripts should not be committed unless they are safe to publish.
 
@@ -47,7 +50,7 @@ chat-transcript-extractor/
 ├── mass_chat_extract.py
 ├── facebook_extract.py
 ├── viber_extract.py
-├── README.md
+├── extractor_utils.py
 ├── images/
 │   ├── facebook/
 │   └── viber/
@@ -98,7 +101,7 @@ ollama pull gemma3:12b
 
 ## Installation
 
-Create a virtual environment:
+Create a virtual environment (optional):
 
 ```bash
 python3 -m venv .venv
@@ -253,11 +256,11 @@ The merged CSV is sorted chronologically and deduplicated by default.
 
 `mass_chat_extract.py` supports three classification modes:
 
-| Mode | Behavior |
-|---|---|
-| `auto` | Uses filename/path hints first, then falls back to the vision model if needed. |
-| `filename` | Uses only filename/path keywords such as `facebook`, `messenger`, or `viber`. |
-| `vision` | Uses the vision model first, then falls back to filename/path hints. |
+| Mode       | Behavior                                                                       |
+| ---------- | ------------------------------------------------------------------------------ |
+| `auto`     | Uses filename/path hints first, then falls back to the vision model if needed. |
+| `filename` | Uses only filename/path keywords such as `facebook`, `messenger`, or `viber`.  |
+| `vision`   | Uses the vision model first, then falls back to filename/path hints.           |
 
 Example:
 
@@ -293,10 +296,10 @@ Available values:
 
 The extractors support:
 
-| Option | Meaning |
-|---|---|
-| `--emoji-mode omit` | Removes emojis from the final transcript. This is the safer default mode for forensic-style extraction. |
-| `--emoji-mode vision` | Allows the model to include emojis only if clearly visible. |
+| Option                | Meaning                                                                                                 |
+| --------------------- | ------------------------------------------------------------------------------------------------------- |
+| `--emoji-mode omit`   | Removes emojis from the final transcript. This is the safer default mode for forensic-style extraction. |
+| `--emoji-mode vision` | Allows the model to include emojis only if clearly visible.                                             |
 
 Default:
 
@@ -308,17 +311,17 @@ Default:
 
 ## Useful extractor flags
 
-| Flag | Purpose |
-|---|---|
-| `--output` | Final CSV path for one extracted image. |
-| `--debug-dir` | Folder for debug artifacts. |
-| `--dump-ocr` | Saves OCR output. Useful for debugging missed text. |
-| `--dump-draft` | Saves intermediate model draft CSVs and repair CSVs. |
-| `--dump-side-map` | Saves inferred left/right speaker mapping. |
-| `--cpu` | Forces CPU mode for OCR. Useful when CUDA is unavailable or incompatible. |
-| `--no-vision` | Uses OCR text only instead of image+OCR vision prompts. |
-| `--grid` | Manually split a collage into a fixed grid, e.g. `2x1`, `3x2`. |
-| `--layout` | Manually split an uneven collage layout, e.g. `2,3`. |
+| Flag              | Purpose                                                                   |
+| ----------------- | ------------------------------------------------------------------------- |
+| `--output`        | Final CSV path for one extracted image.                                   |
+| `--debug-dir`     | Folder for debug artifacts.                                               |
+| `--dump-ocr`      | Saves OCR output. Useful for debugging missed text.                       |
+| `--dump-draft`    | Saves intermediate model draft CSVs and repair CSVs.                      |
+| `--dump-side-map` | Saves inferred left/right speaker mapping.                                |
+| `--cpu`           | Forces CPU mode for OCR. Useful when CUDA is unavailable or incompatible. |
+| `--no-vision`     | Uses OCR text only instead of image+OCR vision prompts.                   |
+| `--grid`          | Manually split a collage into a fixed grid, e.g. `2x1`, `3x2`.            |
+| `--layout`        | Manually split an uneven collage layout, e.g. `2,3`.                      |
 
 Manual collage example:
 

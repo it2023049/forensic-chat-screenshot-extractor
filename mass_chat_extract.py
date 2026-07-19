@@ -1,3 +1,5 @@
+"""Batch orchestrator for classifying chat screenshots, running platform extractors, and merging CSV outputs."""
+
 import os
 
 # Do not override Slurm's GPU assignment.
@@ -28,6 +30,7 @@ IMAGE_EXTENSIONS = {
 #   merged/     -> final merged CSV and manifest JSON
 PER_IMAGE_DIR_NAME = "per_image"
 MERGED_DIR_NAME = "merged"
+SHARED_UTILS_FILENAME = "extractor_utils.py"
 
 
 # ============================================================
@@ -35,10 +38,7 @@ MERGED_DIR_NAME = "merged"
 # ============================================================
 
 def expand_inputs(inputs: List[str]) -> List[Path]:
-    """
-    Expands files, folders, and shell-like globs into image paths.
-    Keeps a stable sorted order.
-    """
+    """Expands file, folder, and glob inputs into a stable list of image paths."""
     images: List[Path] = []
 
     for raw in inputs:
@@ -71,6 +71,7 @@ def expand_inputs(inputs: List[str]) -> List[Path]:
 
 
 def list_images_in_folder(folder: Path) -> List[Path]:
+    """Returns all supported image files found recursively under a folder."""
     return [
         p for p in sorted(folder.rglob("*"), key=lambda x: str(x).lower())
         if p.is_file() and is_image_file(p)
@@ -78,26 +79,17 @@ def list_images_in_folder(folder: Path) -> List[Path]:
 
 
 def is_image_file(path: Path) -> bool:
+    """Checks whether a path is a supported image file."""
     return path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
 
 
 def default_script_path(script_name: str) -> Path:
-    """
-    By default, viber_extract.py and facebook_extract.py are expected to be
-    next to this orchestrator script.
-    """
+    """Returns the default path for an extractor script beside this file."""
     return Path(__file__).resolve().parent / script_name
 
 
 def resolve_output_path(path_value: Optional[str], base_dir: Path, default_name: str) -> Path:
-    """
-    Resolves output/manifest paths.
-
-    Logic:
-    - No path: create the default file inside base_dir.
-    - Relative path: keep it inside base_dir.
-    - Absolute path: respect the exact user-provided location.
-    """
+    """Resolves an output path under a base directory unless it is absolute."""
     if path_value is None:
         return base_dir / default_name
 
@@ -110,10 +102,7 @@ def resolve_output_path(path_value: Optional[str], base_dir: Path, default_name:
 
 
 def safe_output_stem(path: Path) -> str:
-    """
-    Creates a filesystem-safe stem for generated per-image outputs.
-    Example: EP01_Chat_01.png -> EP01_Chat_01
-    """
+    """Creates a filesystem-safe filename stem for generated outputs."""
     stem = path.stem
     stem = re.sub(r"[^A-Za-z0-9._-]+", "_", stem)
     stem = re.sub(r"_+", "_", stem).strip("_")
@@ -121,10 +110,7 @@ def safe_output_stem(path: Path) -> str:
 
 
 def unique_output_stem(path: Path, used_stems: Set[str]) -> str:
-    """
-    Keeps per-image output names readable while avoiding collisions.
-    If two images have the same filename stem, suffix _002, _003, etc.
-    """
+    """Creates a collision-free output stem for one input image."""
     base = safe_output_stem(path)
     stem = base
     counter = 2
@@ -138,8 +124,20 @@ def unique_output_stem(path: Path, used_stems: Set[str]) -> str:
 
 
 def ensure_exists(path: Path, label: str) -> None:
+    """Raises a clear error when a required file or folder is missing."""
     if not path.exists():
         raise FileNotFoundError(f"{label} not found: {path}")
+
+
+def ensure_extractor_utils_available(script_path: Path) -> None:
+    """Checks that extractor_utils.py is beside a refactored extractor script."""
+    utils_path = script_path.resolve().parent / SHARED_UTILS_FILENAME
+
+    if not utils_path.exists():
+        raise FileNotFoundError(
+            f"{SHARED_UTILS_FILENAME} not found next to {script_path}. "
+            "Keep extractor_utils.py in the same folder as facebook_extract.py and viber_extract.py."
+        )
 
 
 # ============================================================
@@ -147,6 +145,7 @@ def ensure_exists(path: Path, label: str) -> None:
 # ============================================================
 
 def normalize_platform(value: str) -> str:
+    """Normalizes platform aliases to facebook, viber, or unknown."""
     text = str(value or "").strip().lower()
 
     if text in {
@@ -165,18 +164,7 @@ def normalize_platform(value: str) -> str:
 
 
 def classify_by_filename(image_path: Path) -> str:
-    """
-    Fast deterministic platform detection from filename OR folder path.
-
-    Examples detected as Facebook:
-    - EP01_Emotional_Grooming_Facebook_Chat_01.png
-    - images/facebook/EP01_Chat_01.png
-    - images/messenger/chat_01.png
-
-    Examples detected as Viber:
-    - EP02_Medical_Emergency_Viber_Chat_01.png
-    - images/viber/IMG_001.png
-    """
+    """Classifies the platform using deterministic filename and folder hints."""
     text = str(image_path).lower().replace("\\", "/")
 
     facebook_keywords = [
@@ -207,16 +195,7 @@ def classify_platform_with_vlm(
     model: str,
     timeout_seconds: int = 120,
 ) -> str:
-    """
-    Uses a vision-capable Ollama model to classify the chat platform.
-
-    Returns:
-    - "viber"
-    - "facebook"
-    - "unknown"
-
-    The model is intentionally asked for a tiny JSON answer only.
-    """
+    """Uses a vision-capable Ollama model to classify the platform."""
     try:
         import ollama
     except Exception as exc:
@@ -280,6 +259,7 @@ Do not explain.
 
 
 def extract_json_object(text: str) -> Dict[str, str]:
+    """Extracts and parses a JSON object from model text output."""
     text = str(text or "").strip()
     text = re.sub(r"^```(?:json)?", "", text, flags=re.I).strip()
     text = re.sub(r"```$", "", text).strip()
@@ -306,19 +286,7 @@ def classify_platform(
     mode: str,
     force_platform: str = "auto",
 ) -> str:
-    """
-    Platform classification strategy.
-
-    force_platform:
-    - facebook: skip classification and force facebook_extract.py
-    - viber: skip classification and force viber_extract.py
-    - auto: use classify-mode normally
-
-    mode:
-    - auto: filename/path first, then VLM if unknown
-    - vision: VLM first, filename/path fallback
-    - filename: filename/path only
-    """
+    """Applies the selected platform classification strategy."""
     forced = normalize_platform(force_platform)
     if forced in {"facebook", "viber"}:
         return forced
@@ -363,6 +331,7 @@ def build_extractor_command(
     debug_dir_path: Path,
     extra_args: List[str],
 ) -> List[str]:
+    """Builds the subprocess command for one platform extractor run."""
     cmd = [
         sys.executable,
         str(script_path),
@@ -417,6 +386,7 @@ def run_extractor(
     debug_dir_path: Path,
     extra_args: List[str],
 ) -> Optional[Path]:
+    """Runs the selected extractor and returns the produced CSV path."""
     if platform == "viber":
         script_path = viber_script
     elif platform == "facebook":
@@ -477,12 +447,14 @@ def run_extractor(
 
 
 def quote_for_log(value: str) -> str:
+    """Quotes command arguments only when logging needs it for readability."""
     if re.search(r"\s", value):
         return f'"{value}"'
     return value
 
 
 def parse_success_csv_path(output: str) -> Optional[Path]:
+    """Finds a CSV output path mentioned in an extractor success log."""
     patterns = [
         r"\[SUCCESS\]\s*CSV saved to:\s*(.+)",
         r"CSV saved to:\s*(.+)",
@@ -508,12 +480,7 @@ def parse_success_csv_path(output: str) -> Optional[Path]:
 # ============================================================
 
 def read_chat_csv(csv_path: Path, source_image: Optional[Path] = None) -> List[Dict[str, str]]:
-    """
-    Reads final extractor CSV files with columns:
-    Time, Sender, Receiver, Message
-
-    Robust against UTF-8 BOM because the extractors write CSVs with utf-8-sig.
-    """
+    """Reads a final extractor CSV into normalized row dictionaries."""
     rows: List[Dict[str, str]] = []
 
     text = read_text_flexible(csv_path)
@@ -545,6 +512,7 @@ def read_chat_csv(csv_path: Path, source_image: Optional[Path] = None) -> List[D
             continue
 
         def get_cell(col: str) -> str:
+            """Returns a safe stripped CSV cell value by column name."""
             i = indexes[col]
             if i >= len(row):
                 return ""
@@ -568,6 +536,7 @@ def read_chat_csv(csv_path: Path, source_image: Optional[Path] = None) -> List[D
 
 def read_text_flexible(path: Path) -> str:
     # Try utf-8-sig first so a BOM in the first header field becomes "Time", not "\ufeffTime".
+    """Reads text using common encodings, including UTF-8 with BOM."""
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
         try:
             return path.read_text(encoding=enc)
@@ -578,11 +547,7 @@ def read_text_flexible(path: Path) -> str:
 
 
 def parse_chat_datetime(time_value: str) -> Tuple[int, datetime]:
-    """
-    Returns (priority, datetime).
-    priority 0 = valid datetime
-    priority 1 = invalid/missing, sorted last
-    """
+    """Parses transcript timestamps for chronological sorting."""
     text = str(time_value or "").strip()
 
     for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y, %H:%M", "%d/%m/%Y,%H:%M"):
@@ -599,9 +564,7 @@ def write_merged_csv(
     output_path: Path,
     dedupe: bool = True,
 ) -> None:
-    """
-    Writes one final CSV sorted by date first and then time.
-    """
+    """Writes one chronologically sorted and optionally deduplicated CSV."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     indexed_rows = list(enumerate(rows))
@@ -645,6 +608,7 @@ def write_merged_csv(
 
 
 def normalize_message_for_dedupe(message: str) -> str:
+    """Normalizes message text only for duplicate-row detection."""
     text = str(message or "").lower()
     text = text.replace("’", "'")
     text = re.sub(r"\s+", " ", text)
@@ -656,6 +620,7 @@ def write_run_manifest(
     records: List[Dict[str, str]],
     output_csv: Path,
 ) -> None:
+    """Writes a JSON manifest describing per-image extraction results."""
     manifest = {
         "output_csv": str(output_csv),
         "items": records,
@@ -673,6 +638,7 @@ def write_run_manifest(
 # ============================================================
 
 def main() -> int:
+    """Parses CLI arguments and runs the batch extraction pipeline."""
     parser = argparse.ArgumentParser(
         description=(
             "Classify chat screenshots/collages as Viber or Facebook Messenger, "
@@ -833,6 +799,13 @@ def main() -> int:
 
     viber_script = Path(args.viber_script) if args.viber_script else default_script_path("viber_extract.py")
     facebook_script = Path(args.facebook_script) if args.facebook_script else default_script_path("facebook_extract.py")
+
+    # The refactored extractors import shared helpers from extractor_utils.py.
+    # Check this early so users get a clear error instead of a child-process ImportError.
+    ensure_exists(viber_script, "Viber extractor script")
+    ensure_exists(facebook_script, "Facebook extractor script")
+    ensure_extractor_utils_available(viber_script)
+    ensure_extractor_utils_available(facebook_script)
 
     results_dir = Path(args.results_dir)
     per_image_dir = results_dir / PER_IMAGE_DIR_NAME

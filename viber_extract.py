@@ -1,3 +1,5 @@
+"""Viber screenshot-to-CSV extractor."""
+
 # Short summary:
 # This script extracts chat messages from screenshot images/collages into CSV.
 # It uses OCR for text/position hints and Ollama/VLM calls for final reconstruction.
@@ -21,47 +23,62 @@ from PyPDF2 import PdfReader
 Box = Tuple[int, int, int, int]
 ScreenCrop = Tuple[int, int, int, int, np.ndarray]
 
+# Shared helpers keep duplicated Facebook/Viber logic in one module.
+from extractor_utils import (
+    extract_text_from_report,
+    extract_year_from_report,
+    parse_grid,
+    parse_layout,
+    trim_white_border,
+    ranges_from_indices,
+    find_separator_bands,
+    split_segments_by_bands,
+    manual_grid_split,
+    manual_layout_split,
+    auto_split_by_white_gutters,
+    contour_fallback_split,
+    sort_screen_crops,
+    minimal_ocr_clean,
+    polygon_to_xywh,
+    looks_like_date,
+    looks_like_time,
+    looks_like_date_or_time,
+    normalize_visible_time_token,
+    parse_ocr_lines,
+    extract_allowed_times_from_ocr,
+    month_to_number,
+    strip_code_fences,
+    extract_json_object,
+    ollama_chat_text,
+    ollama_chat_screen,
+    normalize_phone,
+    normalize_name,
+    clean_name,
+    same_name,
+    name_in_text,
+    build_actor_prompt,
+    infer_report_actors,
+    infer_report_actors_fallback,
+    build_side_evidence,
+    force_date_and_year,
+    extract_hhmm_from_full_time,
+    strip_emojis,
+    normalize_text_for_side_overlap,
+    count_data_rows,
+    merge_side_csvs,
+    apply_side_mapping,
+    write_crop,
+    choose_best_screen_side_csv,
+)
+
+
 
 # ============================================================
 # FILE / REPORT READING
 # ============================================================
 
-def extract_text_from_report(report_path: str) -> str:
-    """Reads a PDF or TXT case report."""
-    path = Path(report_path)
-
-    if path.suffix.lower() == ".txt":
-        for enc in ("utf-8", "utf-8-sig", "latin-1"):
-            try:
-                return path.read_text(encoding=enc)
-            except UnicodeDecodeError:
-                continue
-        return path.read_text(errors="ignore")
-
-    if path.suffix.lower() == ".pdf":
-        try:
-            reader = PdfReader(str(path))
-            pages = []
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    pages.append(text)
-            return "\n".join(pages)
-        except Exception as e:
-            print(f"[WARNING] Could not read PDF: {e}")
-            return ""
-
-    print("[WARNING] Unsupported report type. Use PDF or TXT.")
-    return ""
 
 
-def extract_year_from_report(report_text: str, default_year: int = 2026) -> int:
-    years = re.findall(r"\b(20\d{2})\b", report_text)
-    if not years:
-        return default_year
-
-    # Usually the first report/timeline year is the relevant year.
-    return int(years[0])
 
 
 # ============================================================
@@ -69,299 +86,27 @@ def extract_year_from_report(report_text: str, default_year: int = 2026) -> int:
 # ============================================================
 
 # Parses manual grid layouts such as 2x1 or 3x2.
-def parse_grid(grid: Optional[str]) -> Optional[Tuple[int, int]]:
-    if not grid:
-        return None
-
-    m = re.match(r"^(\d+)x(\d+)$", grid.strip().lower())
-    if not m:
-        raise ValueError("--grid must be like 2x1, 3x2, etc.")
-
-    cols, rows = int(m.group(1)), int(m.group(2))
-    if cols <= 0 or rows <= 0:
-        raise ValueError("--grid values must be positive.")
-
-    return cols, rows
 
 
 # Parses uneven collage row layouts such as 2,3.
-def parse_layout(layout: Optional[str]) -> Optional[List[int]]:
-    if not layout:
-        return None
-
-    try:
-        values = [int(x.strip()) for x in layout.split(",") if x.strip()]
-    except ValueError:
-        raise ValueError("--layout must be like 2,3 or 1,2,3.")
 
-    if not values or any(v <= 0 for v in values):
-        raise ValueError("--layout values must be positive.")
 
-    return values
 
 
-def trim_white_border(image: np.ndarray, threshold: int = 245, pad: int = 0) -> np.ndarray:
-    """Removes pure/near-white external collage borders from a crop."""
-    if image.size == 0:
-        return image
 
-    white = np.all(image >= threshold, axis=2)
-    content = ~white
-    ys, xs = np.where(content)
 
-    if len(xs) == 0 or len(ys) == 0:
-        return image
 
-    h, w = image.shape[:2]
-    x1 = max(0, int(xs.min()) - pad)
-    x2 = min(w, int(xs.max()) + 1 + pad)
-    y1 = max(0, int(ys.min()) - pad)
-    y2 = min(h, int(ys.max()) + 1 + pad)
 
-    return image[y1:y2, x1:x2]
 
 
-def ranges_from_indices(indices: np.ndarray) -> List[Tuple[int, int]]:
-    if len(indices) == 0:
-        return []
 
-    values = [int(x) for x in indices]
-    ranges = []
 
-    start = prev = values[0]
-    for value in values[1:]:
-        if value == prev + 1:
-            prev = value
-        else:
-            ranges.append((start, prev + 1))
-            start = prev = value
 
-    ranges.append((start, prev + 1))
-    return ranges
 
 
-def find_separator_bands(
-    image: np.ndarray,
-    axis: str,
-    white_threshold: int = 235,
-    ratio_threshold: float = 0.72,
-    min_band_size: int = 3,
-) -> List[Tuple[int, int]]:
-    """
-    Finds white separator bands in collages.
-    axis='x' -> vertical separator columns.
-    axis='y' -> horizontal separator rows.
-    """
-    if image.size == 0:
-        return []
 
-    white = np.all(image >= white_threshold, axis=2)
 
-    if axis == "x":
-        ratio = white.mean(axis=0)
-    elif axis == "y":
-        ratio = white.mean(axis=1)
-    else:
-        raise ValueError("axis must be 'x' or 'y'")
 
-    candidates = np.where(ratio >= ratio_threshold)[0]
-    bands = ranges_from_indices(candidates)
-
-    return [(a, b) for a, b in bands if (b - a) >= min_band_size]
-
-
-def split_segments_by_bands(
-    length: int,
-    bands: List[Tuple[int, int]],
-    min_size: int
-) -> List[Tuple[int, int]]:
-    if not bands:
-        return [(0, length)]
-
-    segments = []
-    cur = 0
-
-    for a, b in bands:
-        if a - cur >= min_size:
-            segments.append((cur, a))
-        cur = b
-
-    if length - cur >= min_size:
-        segments.append((cur, length))
-
-    return segments
-
-
-def manual_grid_split(image: np.ndarray, grid: str) -> List[ScreenCrop]:
-    cols, rows = parse_grid(grid)
-    h, w = image.shape[:2]
-    crops = []
-
-    cell_w = w / cols
-    cell_h = h / rows
-
-    for r in range(rows):
-        for c in range(cols):
-            x1 = int(c * cell_w)
-            x2 = int((c + 1) * cell_w)
-            y1 = int(r * cell_h)
-            y2 = int((r + 1) * cell_h)
-
-            crop = trim_white_border(image[y1:y2, x1:x2])
-            crops.append((x1, y1, x2 - x1, y2 - y1, crop))
-
-    return crops
-
-
-def manual_layout_split(image: np.ndarray, layout: str) -> List[ScreenCrop]:
-    """
-    Example: --layout 2,3 means:
-    top row: 2 screenshots
-    bottom row: 3 screenshots
-    """
-    row_counts = parse_layout(layout)
-    h, w = image.shape[:2]
-    crops = []
-
-    row_h = h / len(row_counts)
-
-    for r, count in enumerate(row_counts):
-        y1 = int(r * row_h)
-        y2 = int((r + 1) * row_h)
-        col_w = w / count
-
-        for c in range(count):
-            x1 = int(c * col_w)
-            x2 = int((c + 1) * col_w)
-
-            crop = trim_white_border(image[y1:y2, x1:x2])
-            crops.append((x1, y1, x2 - x1, y2 - y1, crop))
-
-    return crops
-
-
-def auto_split_by_white_gutters(image: np.ndarray) -> List[ScreenCrop]:
-    """
-    Works for pasted collages with white gutters.
-    For important/known uneven layouts, prefer --layout 2,3.
-    """
-    img = trim_white_border(image)
-    h, w = img.shape[:2]
-
-    if h == 0 or w == 0:
-        return []
-
-    min_h = max(180, int(h * 0.18))
-    min_w = max(140, int(w * 0.13))
-
-    horizontal_bands = find_separator_bands(img, axis="y")
-    row_segments = split_segments_by_bands(h, horizontal_bands, min_h)
-
-    crops = []
-
-    for y1, y2 in row_segments:
-        row_img = img[y1:y2, :]
-        vertical_bands = find_separator_bands(row_img, axis="x")
-        col_segments = split_segments_by_bands(w, vertical_bands, min_w)
-
-        for x1, x2 in col_segments:
-            crop = trim_white_border(row_img[:, x1:x2])
-            ch, cw = crop.shape[:2]
-
-            if cw >= min_w and ch >= min_h:
-                crops.append((x1, y1, x2 - x1, y2 - y1, crop))
-
-    if len(crops) <= 1:
-        return [(0, 0, w, h, img)]
-
-    return sort_screen_crops(crops)
-
-
-def contour_fallback_split(image: np.ndarray) -> List[ScreenCrop]:
-    """
-    Fallback if there are no clear white gutters.
-    """
-    img = trim_white_border(image)
-    h, w = img.shape[:2]
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 30, 200)
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    dilated = cv2.dilate(edges, kernel, iterations=1)
-
-    contours, _ = cv2.findContours(
-        dilated,
-        cv2.RETR_EXTERNAL,
-        cv2.CHAIN_APPROX_SIMPLE
-    )
-
-    boxes = []
-
-    for c in contours:
-        x, y, bw, bh = cv2.boundingRect(c)
-
-        if bw > w * 0.18 and bh > h * 0.25 and bh > bw * 0.8:
-            boxes.append((x, y, bw, bh))
-
-    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
-
-    kept = []
-    for box in boxes:
-        x, y, bw, bh = box
-        cx, cy = x + bw / 2, y + bh / 2
-
-        contained = False
-        for kx, ky, kw, kh in kept:
-            if kx <= cx <= kx + kw and ky <= cy <= ky + kh:
-                contained = True
-                break
-
-        if not contained:
-            kept.append(box)
-
-    crops = []
-
-    for x, y, bw, bh in kept:
-        pad = 5
-        x1 = max(0, x - pad)
-        y1 = max(0, y - pad)
-        x2 = min(w, x + bw + pad)
-        y2 = min(h, y + bh + pad)
-
-        crops.append((x1, y1, x2 - x1, y2 - y1, img[y1:y2, x1:x2]))
-
-    if not crops:
-        return [(0, 0, w, h, img)]
-
-    return sort_screen_crops(crops)
-
-
-def sort_screen_crops(crops: List[ScreenCrop]) -> List[ScreenCrop]:
-    if not crops:
-        return []
-
-    boxes = sorted(crops, key=lambda item: item[1])
-    heights = [item[3] for item in boxes]
-    threshold = max(40, int(np.median(heights) * 0.25))
-
-    rows = []
-    current = [boxes[0]]
-
-    for item in boxes[1:]:
-        if abs(item[1] - current[-1][1]) <= threshold:
-            current.append(item)
-        else:
-            rows.append(current)
-            current = [item]
-
-    rows.append(current)
-
-    ordered = []
-    for row in rows:
-        ordered.extend(sorted(row, key=lambda item: item[0]))
-
-    return ordered
 
 
 # Main crop splitter: manual options first, then automatic fallbacks.
@@ -370,6 +115,7 @@ def get_screen_crops(
     grid: Optional[str] = None,
     layout: Optional[str] = None,
 ) -> List[ScreenCrop]:
+    """Loads an image and returns the best detected screen crops."""
     image = cv2.imread(image_path)
 
     if image is None:
@@ -395,76 +141,20 @@ def get_screen_crops(
 # OCR WITH POSITIONED BLOCKS
 # ============================================================
 
-def minimal_ocr_clean(text: str) -> str:
-    text = text.replace("\u200b", " ")
-    text = text.replace("\ufeff", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
 
 
-def polygon_to_xywh(poly) -> Box:
-    xs = [int(p[0]) for p in poly]
-    ys = [int(p[1]) for p in poly]
-
-    x1, x2 = min(xs), max(xs)
-    y1, y2 = min(ys), max(ys)
-
-    return x1, y1, x2 - x1, y2 - y1
 
 
-def looks_like_date(text: str) -> bool:
-    t = text.strip()
-
-    if re.fullmatch(
-        r"(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+\d{1,2}",
-        t,
-        flags=re.I,
-    ):
-        return True
-
-    if re.search(
-        r"(?:Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December)\s+\d{1,2},?\s+\d{4}",
-        t,
-        flags=re.I,
-    ):
-        return True
-
-    return False
 
 
-def looks_like_time(text: str) -> bool:
-    t = text.strip()
-    t = re.sub(r"\s*(vi|v|✓|✔|✔✔)+\s*$", "", t, flags=re.I)
-    t = t.replace("*", ":").replace(",", ":").replace(";", ":").replace(".", ":")
-    return bool(re.fullmatch(r"\d{1,2}:\d{2}", t))
 
 
-def looks_like_date_or_time(text: str) -> bool:
-    return looks_like_date(text) or looks_like_time(text)
 
 
-def normalize_visible_time_token(text: str) -> Optional[str]:
-    """
-    Converts noisy visible time OCR like 10.47, 10;55, 11*05, 10,58 to HH:MM.
-    """
-    t = text.strip()
-    t = re.sub(r"\s*(vi|v|✓|✔|✔✔)+\s*$", "", t, flags=re.I)
-    t = t.replace("*", ":").replace(",", ":").replace(";", ":").replace(".", ":")
-
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", t)
-    if not m:
-        return None
-
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        return None
-
-    return f"{hh:02d}:{mm:02d}"
 
 
 def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
+    """Classifies an OCR box as LEFT, RIGHT, or CENTER by geometry."""
     x, y, bw, bh = bbox
     cx = x + bw / 2
 
@@ -481,13 +171,11 @@ def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
 
 
 def estimate_side_from_bubble_color(image: np.ndarray, bbox: Box) -> Optional[str]:
-    """
-    Detects Viber outgoing purple bubbles from local background color.
-
-    This is used only as a side hint. It is deliberately conservative:
-    - Purple/high-saturation background -> RIGHT
-    - Otherwise return None and fall back to geometry.
-    """
+    """Detects Viber outgoing bubbles using local purple color evidence."""
+    # Notes:
+    # This is used only as a side hint. It is deliberately conservative:
+    # - Purple/high-saturation background -> RIGHT
+    # - Otherwise return None and fall back to geometry.
     if image is None or image.size == 0:
         return None
 
@@ -535,6 +223,7 @@ def position_tag_from_color_or_bbox(
     crop_w: int,
     text: str
 ) -> str:
+    """Classifies a Viber OCR box using color evidence before geometry."""
     if looks_like_date_or_time(text):
         return position_tag_from_bbox(bbox, crop_w, text)
 
@@ -546,17 +235,16 @@ def position_tag_from_color_or_bbox(
 
 
 def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
-    """
-    Fixes OCR fragments inside a LEFT bubble that were marked RIGHT because the
-    word was near the middle of a wide incoming bubble.
-
-    Example fixed:
-    LEFT: "A piece of metal from an"
-    LEFT: "explosive hit my"
-    RIGHT wrongly: "leg"
-    RIGHT wrongly: "badly:"
-    -> all same visual line becomes LEFT.
-    """
+    """Corrects OCR side labels for fragments on the same visual line."""
+    # Notes:
+    # word was near the middle of a wide incoming bubble.
+    #
+    # Example fixed:
+    # LEFT: "A piece of metal from an"
+    # LEFT: "explosive hit my"
+    # RIGHT wrongly: "leg"
+    # RIGHT wrongly: "badly:"
+    # -> all same visual line becomes LEFT.
     if not blocks:
         return blocks
 
@@ -613,7 +301,7 @@ def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
 
 # Runs EasyOCR and keeps each text block with side/position metadata.
 def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
-    """Returns OCR blocks with POS and coordinates."""
+    """Runs EasyOCR and returns positioned OCR blocks as text."""
     upscaled = cv2.resize(
         crop,
         None,
@@ -687,98 +375,10 @@ def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
 # OCR PARSING / SCREEN TIME LIMITS
 # ============================================================
 
-def parse_ocr_lines(ocr_data: str) -> List[Dict[str, str]]:
-    pattern = re.compile(
-        r"\[BLOCK\s+(?P<block>\d+)\]\s+"
-        r"\[POS=(?P<pos>LEFT|RIGHT|CENTER)\]\s+"
-        r"\[X=(?P<x>\d+)\]\s+"
-        r"\[Y=(?P<y>\d+)\]\s+"
-        r"\[W=(?P<w>\d+)\]\s+"
-        r"\[H=(?P<h>\d+)\]"
-        r"(?:\s+\[CONF=[^\]]+\])?\s+"
-        r"(?P<text>.*)$",
-        re.I,
-    )
-
-    current_screen = None
-    rows = []
-
-    for line in ocr_data.splitlines():
-        sm = re.match(r"\[SCREEN\s+(\d+)\]", line.strip(), flags=re.I)
-        if sm:
-            current_screen = int(sm.group(1))
-            continue
-
-        bm = pattern.search(line.strip())
-        if not bm:
-            continue
-
-        rows.append({
-            "screen": str(current_screen or ""),
-            "block": bm.group("block"),
-            "pos": bm.group("pos").upper(),
-            "x": bm.group("x"),
-            "y": bm.group("y"),
-            "w": bm.group("w"),
-            "h": bm.group("h"),
-            "text": bm.group("text").strip(),
-        })
-
-    return rows
 
 
-def extract_allowed_times_from_ocr(screen_ocr: str) -> Set[str]:
-    """
-    Visible bubble times in a screenshot.
-    Ignores top status bar time by requiring it to appear after the date separator/header area.
-    """
-    rows = parse_ocr_lines(screen_ocr)
-    allowed = set()
-
-    date_y = None
-    for row in rows:
-        if looks_like_date(row["text"]):
-            try:
-                date_y = int(row["y"])
-            except ValueError:
-                pass
-
-    for row in rows:
-        try:
-            y = int(row["y"])
-        except ValueError:
-            continue
-
-        # Ignore status/header time near the top.
-        if date_y is not None and y <= date_y:
-            continue
-        if date_y is None and y < 250:
-            continue
-
-        t = normalize_visible_time_token(row["text"])
-        if t:
-            allowed.add(t)
-
-    return allowed
 
 
-def month_to_number(month: str) -> Optional[int]:
-    m = month.strip().lower()[:3]
-    table = {
-        "jan": 1,
-        "feb": 2,
-        "mar": 3,
-        "apr": 4,
-        "may": 5,
-        "jun": 6,
-        "jul": 7,
-        "aug": 8,
-        "sep": 9,
-        "oct": 10,
-        "nov": 11,
-        "dec": 12,
-    }
-    return table.get(m)
 
 
 def extract_visible_date_from_ocr(
@@ -786,10 +386,9 @@ def extract_visible_date_from_ocr(
     default_year: int,
     previous_date_hint: str = ""
 ) -> str:
-    """
-    Returns DD/MM/YYYY based on visible Viber date separator.
-    If no date is visible, returns previous_date_hint if available.
-    """
+    """Extracts the visible date separator from OCR text."""
+    # Notes:
+    # If no date is visible, returns previous_date_hint if available.
     rows = parse_ocr_lines(screen_ocr)
 
     for row in rows:
@@ -820,241 +419,40 @@ def extract_visible_date_from_ocr(
 # LLM HELPERS
 # ============================================================
 
-def strip_code_fences(text: str) -> str:
-    text = text.strip()
-    text = re.sub(r"^```(?:csv|json|text)?", "", text, flags=re.I).strip()
-    text = re.sub(r"```$", "", text).strip()
-    return text
 
 
-def extract_json_object(text: str) -> str:
-    text = strip_code_fences(text)
-    start = text.find("{")
-    end = text.rfind("}")
-
-    if start == -1 or end == -1 or end <= start:
-        return text
-
-    return text[start:end + 1]
 
 
-def ollama_chat_text(model: str, prompt: str) -> str:
-    response = ollama.chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        options={"temperature": 0},
-    )
-    return response["message"]["content"].strip()
 
 
-def ollama_chat_screen(
-    model: str,
-    prompt: str,
-    image_path: str,
-    use_vision: bool = True
-) -> str:
-    message = {
-        "role": "user",
-        "content": prompt,
-    }
-
-    if use_vision:
-        message["images"] = [image_path]
-
-    try:
-        response = ollama.chat(
-            model=model,
-            messages=[message],
-            options={"temperature": 0},
-        )
-        return response["message"]["content"].strip()
-
-    except Exception as e:
-        if use_vision:
-            print(f"[WARNING] Vision call failed for {image_path}: {e}")
-            print("[WARNING] Retrying with OCR text only. Emojis may not be reliable.")
-            return ollama_chat_text(model, prompt)
-
-        raise
 
 
 # ============================================================
 # REPORT ACTORS + SIDE MAP
 # ============================================================
 
-def normalize_phone(value: str) -> str:
-    return re.sub(r"\D+", "", value or "")
-
-
-def normalize_name(value: str) -> str:
-    return re.sub(r"\s+", " ", value or "").strip().lower()
-
-
-def clean_name(value: str) -> str:
-    value = str(value or "").strip()
-    value = re.sub(r"\s+", " ", value)
-    value = re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
-    return value
-
-
-def same_name(a: str, b: str) -> bool:
-    return normalize_name(clean_name(a)) == normalize_name(clean_name(b))
-
-
-def name_in_text(name: str, text: str) -> bool:
-    name_norm = normalize_name(clean_name(name))
-    text_norm = normalize_name(text)
-
-    if not name_norm or not text_norm:
-        return False
-
-    return name_norm in text_norm
-
-
-def build_actor_prompt(report_text: str) -> str:
-    return f"""
-Extract the chat actors from this case report.
-
-CASE REPORT:
-{report_text}
-
-Return only JSON with this structure:
-{{
-  "victim": "victim full name",
-  "participants": [
-    {{"name":"full name", "role":"victim or suspect", "contact_numbers":["..."]}}
-  ]
-}}
-
-Rules:
-1. Include the victim/complainant.
-2. Include suspects/scammers and their contact numbers if present.
-3. Do not output explanations.
-"""
-
-
-def infer_report_actors(report_text: str, model: str) -> Dict:
-    """
-    Deterministic actor extraction from the report.
-    We do NOT use the LLM here because wrong actor JSON breaks side_map.
-    Keeps the same function signature so the rest of the code does not change.
-    """
-    participants = []
-
-    # -------------------------
-    # Victim
-    # -------------------------
-    victim = ""
-
-    victim_patterns = [
-        r"VICTIM\s*/\s*COMPLAINANT:.*?Full Name:\s*([^\n\r•]+)",
-        r"Full Name:\s*([^\n\r•]+)",
-        r"Target/Victim:\s*([^\n\r•]+)",
-    ]
-
-    for pattern in victim_patterns:
-        m = re.search(pattern, report_text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            victim = clean_name(m.group(1))
-            break
-
-    if victim:
-        participants.append({
-            "name": victim,
-            "role": "victim",
-            "contact_numbers": []
-        })
-
-    # -------------------------
-    # Suspects + nearby contact numbers
-    # -------------------------
-    suspect_pattern = re.compile(
-        r"Suspect\s*\d+:\s*([^\n\r]+)(.*?)(?=(?:•\s*)?Suspect\s*\d+:|2\.\s*BACKGROUND|3\.\s*TECHNICAL|$)",
-        flags=re.IGNORECASE | re.DOTALL
-    )
-
-    phone_pattern = re.compile(r"\+\d[\d\s().-]{5,}\d")
-
-    for m in suspect_pattern.finditer(report_text):
-        suspect_name = clean_name(m.group(1))
-        suspect_block = m.group(2)
-
-        phones = phone_pattern.findall(suspect_block)
-        phones = [p.strip() for p in phones]
-
-        if suspect_name:
-            participants.append({
-                "name": suspect_name,
-                "role": "suspect",
-                "contact_numbers": phones
-            })
-
-    # -------------------------
-    # Fallback: Scammer Names Used
-    # -------------------------
-    if not any(p["role"] == "suspect" for p in participants):
-        m = re.search(r"Scammer Names Used:\s*([^\n\r]+)", report_text, flags=re.IGNORECASE)
-        if m:
-            names = [clean_name(x) for x in re.split(r",| and ", m.group(1))]
-            for name in names:
-                if name and not any(same_name(name, p["name"]) for p in participants):
-                    participants.append({
-                        "name": name,
-                        "role": "suspect",
-                        "contact_numbers": []
-                    })
-
-    return {
-        "victim": victim,
-        "participants": participants
-    }
 
 
 
-def infer_report_actors_fallback(report_text: str) -> Dict:
-    victim = ""
-    participants = []
 
-    m = re.search(r"Full Name:\s*([^\n•]+)", report_text, flags=re.I)
-    if m:
-        victim = clean_name(m.group(1))
 
-    if victim:
-        participants.append({
-            "name": victim,
-            "role": "victim",
-            "contact_numbers": [],
-        })
 
-    for sm in re.finditer(r"Suspect\s*\d+:\s*([^\n]+)", report_text, flags=re.I):
-        name = clean_name(sm.group(1))
-        if name:
-            participants.append({
-                "name": name,
-                "role": "suspect",
-                "contact_numbers": [],
-            })
 
-    # Attach nearby phone numbers as a rough fallback.
-    phones = re.findall(r"\+\d[\d\s().-]{5,}\d", report_text)
-    suspect_i = 0
-    for p in participants:
-        if p["role"] == "suspect" and suspect_i < len(phones):
-            p["contact_numbers"] = [phones[suspect_i]]
-            suspect_i += 1
 
-    return {
-        "victim": victim,
-        "participants": participants,
-    }
+
+
+
+
+
+
+
 
 
 def find_header_match(ocr_data: str, actors: Dict) -> str:
-    """
-    In Viber, the top header usually contains the OTHER participant/contact.
-    This function deterministically checks the top OCR area for participant names
-    and contact numbers from the report.
-    """
+    """Matches top header OCR against known report actors."""
+    # Notes:
+    # This function deterministically checks the top OCR area for participant names
+    # and contact numbers from the report.
     rows = parse_ocr_lines(ocr_data)
     participants = [p for p in actors.get("participants", []) if p.get("name")]
 
@@ -1109,62 +507,18 @@ def find_header_match(ocr_data: str, actors: Dict) -> str:
 
 
 
-def build_side_evidence(ocr_data: str) -> str:
-    rows = parse_ocr_lines(ocr_data)
-
-    side_texts = {
-        "LEFT": [],
-        "RIGHT": [],
-        "CENTER": [],
-    }
-
-    side_phones = {
-        "LEFT": [],
-        "RIGHT": [],
-        "CENTER": [],
-    }
-
-    phone_pattern = re.compile(r"\+?\d[\d\s().-]{5,}\d")
-
-    for row in rows:
-        pos = row["pos"]
-        text = row["text"]
-
-        side_texts[pos].append(text)
-
-        for phone in phone_pattern.findall(text):
-            side_phones[pos].append(phone.strip())
-
-    lines = ["SIDE EVIDENCE SUMMARY"]
-
-    for side in ["LEFT", "RIGHT", "CENTER"]:
-        lines.append(f"\n{side} phone/contact-like strings:")
-
-        phones = side_phones[side][:12]
-        if phones:
-            lines.extend(f"- {p}" for p in phones)
-        else:
-            lines.append("- none")
-
-        lines.append(f"{side} sample OCR texts:")
-        for text in side_texts[side][:18]:
-            lines.append(f"- {text}")
-
-    return "\n".join(lines)
 
 
 def deterministic_viber_side_map(
     actors: Dict,
     ocr_data: str
 ) -> Optional[Dict[str, str]]:
-    """
-    Deterministic Viber side mapping.
-
-    Main rule:
-    If Viber header shows a suspect/contact from the report, then:
-    LEFT = header contact
-    RIGHT = victim / screenshot owner
-    """
+    """Infers Viber LEFT/RIGHT names from header and contact evidence."""
+    # Notes:
+    # Main rule:
+    # If Viber header shows a suspect/contact from the report, then:
+    # LEFT = header contact
+    # RIGHT = victim / screenshot owner
     victim = clean_name(actors.get("victim", ""))
 
     participants = [
@@ -1251,6 +605,7 @@ def build_side_map_prompt(
     ocr_data: str,
     platform_hint: str
 ) -> str:
+    """Builds the platform-specific LEFT/RIGHT speaker mapping prompt."""
     side_evidence = build_side_evidence(ocr_data)
 
     return f"""
@@ -1287,6 +642,7 @@ def infer_side_mapping(
     platform_hint: str,
     model: str
 ) -> Dict[str, str]:
+    """Returns the final fixed LEFT/RIGHT speaker mapping."""
     deterministic = deterministic_viber_side_map(actors, ocr_data)
 
     if deterministic:
@@ -1331,6 +687,7 @@ def build_screen_prompt(
     emoji_mode: str,
     bubble_hints: str = "",
 ) -> str:
+    """Builds the extraction prompt for one screenshot."""
     allowed_times_text = ", ".join(sorted(allowed_times)) if allowed_times else "unknown"
     if emoji_mode == "vision":
         emoji_rule = "Include only emojis that are clearly and unambiguously visible in the screenshot. Do not infer, guess, or substitute emojis. If unsure, omit the emoji."
@@ -1390,6 +747,7 @@ def build_screen_repair_prompt(
     emoji_mode: str,
     bubble_hints: str = "",
 ) -> str:
+    """Builds the repair prompt for one screenshot CSV draft."""
     allowed_times_text = ", ".join(sorted(allowed_times)) if allowed_times else "unknown"
     if emoji_mode == "vision":
         emoji_rule = "Include only emojis that are clearly and unambiguously visible in the screenshot. Do not infer, guess, or substitute emojis. If unsure, omit the emoji."
@@ -1443,64 +801,14 @@ Final CSV:
 # CSV NORMALIZATION
 # ============================================================
 
-def force_date_and_year(time_value: str, visible_date: str, default_year: int) -> str:
-    """
-    Normalizes any DD/MM/YYYY HH:MM and forces the visible date/year.
-    Final format: DD/MM/YYYY HH:MM
-    """
-    time_value = str(time_value).strip().strip('"')
-    time_value = time_value.replace(";", ":")
-    time_value = re.sub(r"\s+", " ", time_value)
-
-    # Accept both:
-    # DD/MM/YYYY, HH:MM
-    # DD/MM/YYYY HH:MM
-    m = re.search(
-        r"(\d{1,2})/(\d{1,2})/(20\d{2})\s*,?\s*(\d{1,2})[:.;,*](\d{2})",
-        time_value
-    )
-
-    if m:
-        hh = int(m.group(4))
-        mm = int(m.group(5))
-
-        if visible_date:
-            return f"{visible_date} {hh:02d}:{mm:02d}"
-
-        dd = int(m.group(1))
-        mo = int(m.group(2))
-        return f"{dd:02d}/{mo:02d}/{default_year} {hh:02d}:{mm:02d}"
-
-    # Fallback: if only HH:MM exists, combine with visible date.
-    tv = normalize_visible_time_token(time_value)
-    if tv and visible_date:
-        return f"{visible_date} {tv}"
-
-    return time_value
 
 
-def extract_hhmm_from_full_time(time_value: str) -> Optional[str]:
-    # Accept both:
-    # DD/MM/YYYY, HH:MM
-    # DD/MM/YYYY HH:MM
-    m = re.search(r"\s*,?\s*(\d{1,2})[:.;,*](\d{2})\s*$", time_value)
-    if not m:
-        return None
-
-    hh = int(m.group(1))
-    mm = int(m.group(2))
-
-    if not (0 <= hh <= 23 and 0 <= mm <= 59):
-        return None
-
-    return f"{hh:02d}:{mm:02d}"
 
 
 def is_ui_message(message: str) -> bool:
-    """
-    Generic Viber/UI filtering for messages after LLM extraction.
-    Avoid case-specific names, phone numbers, or conversation content.
-    """
+    """Detects platform UI text that should not become a chat row."""
+    # Notes:
+    # Avoid case-specific names, phone numbers, or conversation content.
     m = str(message or "").strip()
     low = m.lower()
 
@@ -1542,12 +850,10 @@ def is_ui_message(message: str) -> bool:
 
 
 def clean_message_text(message: str) -> str:
-    """
-    Generic OCR/message cleanup for bulk use.
-
-    No case-specific names, phone numbers, or emoji substitutions are used here.
-    This function only applies pattern-based OCR cleanup that is broadly useful.
-    """
+    """Applies conservative OCR and punctuation cleanup to messages."""
+    # Notes:
+    # No case-specific names, phone numbers, or emoji substitutions are used here.
+    # This function only applies pattern-based OCR cleanup that is broadly useful.
     msg = str(message or "").strip()
 
     # CSV/quote cleanup.
@@ -1664,58 +970,23 @@ def clean_message_text(message: str) -> str:
     return msg
 
 
-def strip_emojis(text: str) -> str:
-    """
-    Removes emoji/symbol ranges when --emoji-mode omit is selected.
-    This is intentionally generic and not tied to specific emoji characters.
-    """
-    emoji_re = re.compile(
-        "["
-        "\U0001F1E6-\U0001F1FF"  # flags
-        "\U0001F300-\U0001F5FF"  # symbols/pictographs
-        "\U0001F600-\U0001F64F"  # emoticons
-        "\U0001F680-\U0001F6FF"  # transport/map
-        "\U0001F700-\U0001F77F"
-        "\U0001F780-\U0001F7FF"
-        "\U0001F800-\U0001F8FF"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA00-\U0001FAFF"
-        "\u2600-\u26FF"
-        "\u2700-\u27BF"
-        "]+",
-        flags=re.UNICODE,
-    )
-    text = emoji_re.sub("", str(text or ""))
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
 
 
-def normalize_text_for_side_overlap(text: str) -> Set[str]:
-    """
-    Normalizes text only for fuzzy overlap between an LLM message and OCR bubble text.
-    This is not used as final transcript text.
-    """
-    t = str(text or "").lower()
-    t = re.sub(r"\b([a-z]+)'\$", r"\1s", t)
-    t = t.replace("|", "i").replace("!", "i")
-    t = re.sub(r"[^a-z0-9]+", " ", t)
-    return {w for w in t.split() if len(w) >= 2}
 
 
 def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
-    """
-    Build approximate bubble groups from positioned OCR blocks.
-
-    The LLM may sometimes assign LEFT/RIGHT incorrectly. For Viber screenshots,
-    the OCR geometry is more reliable for side than the LLM. Each group ends at
-    the visible bubble timestamp that follows the bubble text.
-
-    Returns groups like:
-    {"time": "11:02", "side": "RIGHT", "text": "..."}
-    """
+    """Groups OCR blocks into timestamped bubble hints."""
+    # Notes:
+    # The LLM may sometimes assign LEFT/RIGHT incorrectly. For Viber screenshots,
+    # the OCR geometry is more reliable for side than the LLM. Each group ends at
+    # the visible bubble timestamp that follows the bubble text.
+    #
+    # Returns groups like:
+    # {"time": "11:02", "side": "RIGHT", "text": "..."}
     rows = parse_ocr_lines(screen_ocr)
 
     def to_int(value: str, default: int = 0) -> int:
+        """Safely converts a value to int with a fallback."""
         try:
             return int(value)
         except Exception:
@@ -1793,10 +1064,9 @@ def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
 
 
 def build_viber_bubble_hints(ocr_bubble_groups: Optional[List[Dict[str, str]]]) -> str:
-    """
-    Human-readable bubble hints from OCR geometry.
-    These are noisy support, but they help the VLM keep one row per rounded bubble.
-    """
+    """Formats Viber OCR bubble groups as prompt hints."""
+    # Notes:
+    # These are noisy support, but they help the VLM keep one row per rounded bubble.
     if not ocr_bubble_groups:
         return "No reliable Viber bubble hints."
 
@@ -1818,12 +1088,10 @@ def infer_side_for_message_from_ocr(
     hhmm: Optional[str],
     ocr_bubble_groups: Optional[List[Dict[str, str]]],
 ) -> Optional[str]:
-    """
-    Infer the side of one extracted message from OCR bubble groups.
-
-    If a timestamp is unique in a screenshot, use its OCR side directly.
-    If the same HH:MM appears in multiple bubbles, choose by fuzzy token overlap.
-    """
+    """Corrects message side using matching OCR bubble groups."""
+    # Notes:
+    # If a timestamp is unique in a screenshot, use its OCR side directly.
+    # If the same HH:MM appears in multiple bubbles, choose by fuzzy token overlap.
     if not hhmm or not ocr_bubble_groups:
         return None
 
@@ -1859,6 +1127,7 @@ def infer_side_for_message_from_ocr(
 
 
 def normalize_for_viber_fragment(text: str) -> str:
+    """Normalizes Viber text for fragment and overlap checks."""
     text = str(text or "").lower()
     text = text.replace("’", "'")
     text = re.sub(r"\blovel\b", "love", text)
@@ -1872,6 +1141,7 @@ def normalize_for_viber_fragment(text: str) -> str:
 
 
 def viber_token_overlap_score(a: str, b: str) -> float:
+    """Scores Viber token overlap while preserving duplicate-token counts."""
     a_norm = normalize_for_viber_fragment(a)
     b_norm = normalize_for_viber_fragment(b)
 
@@ -1900,12 +1170,10 @@ def split_message_by_ocr_bubbles(
     side: str,
     ocr_bubble_groups: Optional[List[Dict[str, str]]] = None,
 ) -> List[Tuple[Optional[Dict[str, str]], str]]:
-    """
-    Splits an LLM row that merged multiple Viber rounded bubbles.
-
-    Viber bubbles have visible timestamps. If two separate bubbles share the same
-    HH:MM, the extractor must still output two rows.
-    """
+    """Splits merged Viber rows using timestamped OCR bubble groups."""
+    # Notes:
+    # Viber bubbles have visible timestamps. If two separate bubbles share the same
+    # HH:MM, the extractor must still output two rows.
     if not hhmm or not ocr_bubble_groups:
         return [(None, message)]
 
@@ -1955,6 +1223,7 @@ def best_ocr_group_for_message(
     side: str,
     ocr_bubble_groups: Optional[List[Dict[str, str]]] = None,
 ) -> Optional[Dict[str, str]]:
+    """Finds the best matching OCR bubble group for a Viber message."""
     if not hhmm or not ocr_bubble_groups:
         return None
 
@@ -1987,12 +1256,10 @@ def add_missing_ocr_bubbles_to_rows(
     emoji_mode: str,
     ocr_bubble_groups: Optional[List[Dict[str, str]]] = None,
 ) -> None:
-    """
-    Adds high-confidence Viber OCR bubble groups that the LLM omitted.
-
-    Safer than Messenger auto-add because Viber has per-bubble timestamps. Still
-    conservative: no add if a same-time/same-side row already overlaps strongly.
-    """
+    """Adds omitted high-confidence Viber OCR bubble rows."""
+    # Notes:
+    # Safer than Messenger auto-add because Viber has per-bubble timestamps. Still
+    # conservative: no add if a same-time/same-side row already overlaps strongly.
     if not visible_date or not ocr_bubble_groups:
         return
 
@@ -2049,6 +1316,7 @@ def normalize_side_csv(
     emoji_mode: str = "omit",
     ocr_bubble_groups: Optional[List[Dict[str, str]]] = None,
 ) -> str:
+    """Cleans and validates model side CSV rows."""
     text = strip_code_fences(side_csv)
 
     reader = csv.reader(io.StringIO(text))
@@ -2167,91 +1435,15 @@ def normalize_side_csv(
     return out.getvalue().strip() + "\n"
 
 
-def count_data_rows(side_csv: str) -> int:
-    rows = list(csv.reader(io.StringIO(strip_code_fences(side_csv))))
-    return sum(1 for r in rows if r and len(r) >= 3 and r[0].strip().lower() != "time")
 
 
-def merge_side_csvs(csv_parts: List[str]) -> str:
-    out = io.StringIO()
-    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
-
-    writer.writerow(["Time", "Side", "Message"])
-
-    seen = set()
-
-    for part in csv_parts:
-        reader = csv.reader(io.StringIO(strip_code_fences(part)))
-
-        for row in reader:
-            if not row:
-                continue
-
-            if len(row) >= 3 and row[0].strip().lower() == "time":
-                continue
-
-            if len(row) != 3:
-                continue
-
-            time_value = row[0].strip()
-            side = row[1].strip().upper()
-            message = row[2].strip()
-
-            if side not in {"LEFT", "RIGHT"} or not time_value or not message:
-                continue
-
-            item = (time_value, side, message)
-            if item in seen:
-                continue
-
-            seen.add(item)
-            writer.writerow(item)
-
-    return out.getvalue().strip() + "\n"
 
 
 # Converts LEFT/RIGHT rows into Sender/Receiver rows.
-def apply_side_mapping(side_csv: str, side_map: Dict[str, str]) -> str:
-    reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
-
-    out = io.StringIO()
-    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
-
-    writer.writerow(["Time", "Sender", "Receiver", "Message"])
-
-    seen = set()
-
-    for row in reader:
-        if not row:
-            continue
-
-        if len(row) >= 3 and row[0].strip().lower() == "time":
-            continue
-
-        if len(row) != 3:
-            continue
-
-        time_value = row[0].strip()
-        side = row[1].strip().upper()
-        message = row[2].strip()
-
-        if side not in {"LEFT", "RIGHT"} or not time_value or not message:
-            continue
-
-        sender = side_map[side]
-        receiver = side_map["RIGHT"] if side == "LEFT" else side_map["LEFT"]
-
-        item = (time_value, sender, receiver, message)
-        if item in seen:
-            continue
-
-        seen.add(item)
-        writer.writerow(item)
-
-    return out.getvalue().strip() + "\n"
 
 
 def extract_last_date_from_side_csv(side_csv: str) -> str:
+    """Returns the last DD/MM/YYYY date seen in a side CSV."""
     reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
     last_date = ""
 
@@ -2268,42 +1460,14 @@ def extract_last_date_from_side_csv(side_csv: str) -> str:
 # PIPELINE
 # ============================================================
 
-def write_crop(path: Path, crop: np.ndarray) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(path), crop)
 
 
 def write_debug_text(path: Path, content: str) -> None:
+    """Writes debug text to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(content or ""), encoding="utf-8")
 
 
-def choose_best_screen_side_csv(
-    draft_norm: str,
-    repaired_norm: str,
-    allowed_times: Set[str],
-) -> str:
-    """
-    Avoids repair hallucinations.
-    The repair output must not explode in row count.
-    """
-    draft_count = count_data_rows(draft_norm)
-    repair_count = count_data_rows(repaired_norm)
-
-    if repair_count == 0 and draft_count > 0:
-        return draft_norm
-
-    if draft_count == 0 and repair_count > 0:
-        return repaired_norm
-
-    # A screen cannot have wildly more rows than visible bubble times + some same-time messages.
-    max_reasonable = max(len(allowed_times) + 4, draft_count + 3)
-
-    if repair_count > max_reasonable:
-        return draft_norm
-
-    # Prefer repaired if reasonable.
-    return repaired_norm
 
 
 def process_viber_image(
@@ -2322,6 +1486,7 @@ def process_viber_image(
     dump_side_map: bool,
 ) -> str:
     # Use the report year when screenshots show dates without a year.
+    """Runs the full Viber extraction pipeline for one image."""
     default_year = extract_year_from_report(report_text)
 
     # Split the input image/collage into individual phone screens.
