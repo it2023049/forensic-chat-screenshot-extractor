@@ -1,0 +1,22 @@
+name: Python syntax check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  py-compile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile extractor_utils.py facebook_extract.py viber_extract.py mass_chat_extract.py

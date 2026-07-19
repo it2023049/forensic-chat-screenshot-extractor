@@ -1,0 +1,5 @@
+numpy
+opencv-python-headless
+easyocr
+ollama
+PyPDF2

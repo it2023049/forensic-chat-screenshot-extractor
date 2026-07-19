@@ -1,35 +1,52 @@
-# Python
+# Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Virtual environments
 .venv/
 venv/
 env/
 myenv/
 
+# Build/package artifacts
+build/
+dist/
+*.egg-info/
+
 # Generated outputs
 results/
-accuracy_results/
-results_full_patched/
-accuracy_full_patched/
+debug/
 *_debug/
 *_extracted.csv
 *_merged_chats.csv
 *.manifest.json
 
-# Private/local data
+# Private/local input data
 images/
 case_reports/
-ground_truth/
 *.pdf
 *.xlsx
+*.xls
 *.xlsm
 
 # Logs
+*.log
 *.out
 *.err
-*.log
 
-# OS/editor
+# Environment/config files
+.env
+.env.*
+
+# Notebook/cache artifacts
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor files
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
