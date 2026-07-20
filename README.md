@@ -242,12 +242,14 @@ python3 mass_chat_extract.py \
 | `--dump-side-map`     | Save inferred left/right speaker mapping.                                              |
 | `--cpu`               | Force CPU mode for EasyOCR.                                                            |
 | `--no-vision`         | Use OCR text only instead of image+OCR vision prompting.                               |
-| `--emoji-mode omit`   | Remove emojis from final output.                                                       |
-| `--emoji-mode vision` | Keep only clearly visible emojis according to the vision model.                        |
+| `--emoji-mode omit`   | Recommended mode. Removes emojis from the final output.                                |
+| `--emoji-mode vision` | Attempts to keep only clearly visible emojis according to the vision model.            |
 | `--grid`              | Manually split a collage into a fixed grid, for example `2x1`.                         |
 | `--layout`            | Manually split uneven collage rows, for example `2,3`.                                 |
 | `--classify-mode`     | Select platform classification strategy for batch extraction.                          |
 | `--force-platform`    | Force all images to use the Facebook or Viber extractor.                               |
+
+> **Note:** `--emoji-mode omit` is recommended for most runs. Emoji recognition is still experimental, and the extractor may miss, misread, or hallucinate emojis when using `--emoji-mode vision`.
 
 Manual collage example:
 
