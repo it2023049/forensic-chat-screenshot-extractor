@@ -3,3 +3,4 @@ opencv-python-headless
 easyocr
 ollama
 PyPDF2
+openpyxl

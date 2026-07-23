@@ -1,13 +1,10 @@
 """Shared helper functions used by both chat screenshot extractors."""
 
-# This module contains functions that were identical in the Facebook Messenger
-# and Viber extractors. Platform-specific extraction logic remains in the
-# individual extractor scripts.
-
 import csv
 import io
 import re
 from pathlib import Path
+from difflib import SequenceMatcher
 from typing import Dict, List, Optional, Tuple, Set
 
 import cv2
@@ -15,11 +12,8 @@ import numpy as np
 import ollama
 from PyPDF2 import PdfReader
 
-
-# Common geometry aliases used by OCR and crop splitting helpers.
 Box = Tuple[int, int, int, int]
 ScreenCrop = Tuple[int, int, int, int, np.ndarray]
-
 
 def extract_text_from_report(report_path: str) -> str:
     """Reads plain-text or PDF case-report content."""
@@ -49,7 +43,6 @@ def extract_text_from_report(report_path: str) -> str:
     print("[WARNING] Unsupported report type. Use PDF or TXT.")
     return ""
 
-
 def extract_year_from_report(report_text: str, default_year: int = 2026) -> int:
     """Finds the first timeline year in the case report."""
     years = re.findall(r"\b(20\d{2})\b", report_text)
@@ -58,7 +51,6 @@ def extract_year_from_report(report_text: str, default_year: int = 2026) -> int:
 
     # Usually the first report/timeline year is the relevant year.
     return int(years[0])
-
 
 def parse_grid(grid: Optional[str]) -> Optional[Tuple[int, int]]:
     """Parses a regular collage grid specification."""
@@ -75,7 +67,6 @@ def parse_grid(grid: Optional[str]) -> Optional[Tuple[int, int]]:
 
     return cols, rows
 
-
 def parse_layout(layout: Optional[str]) -> Optional[List[int]]:
     """Parses an uneven collage row-layout specification."""
     if not layout:
@@ -90,7 +81,6 @@ def parse_layout(layout: Optional[str]) -> Optional[List[int]]:
         raise ValueError("--layout values must be positive.")
 
     return values
-
 
 def trim_white_border(image: np.ndarray, threshold: int = 245, pad: int = 0) -> np.ndarray:
     """Removes near-white outer borders from an image crop."""
@@ -112,7 +102,6 @@ def trim_white_border(image: np.ndarray, threshold: int = 245, pad: int = 0) -> 
 
     return image[y1:y2, x1:x2]
 
-
 def ranges_from_indices(indices: np.ndarray) -> List[Tuple[int, int]]:
     """Converts consecutive index values into half-open ranges."""
     if len(indices) == 0:
@@ -131,7 +120,6 @@ def ranges_from_indices(indices: np.ndarray) -> List[Tuple[int, int]]:
 
     ranges.append((start, prev + 1))
     return ranges
-
 
 def find_separator_bands(
     image: np.ndarray,
@@ -161,7 +149,6 @@ def find_separator_bands(
 
     return [(a, b) for a, b in bands if (b - a) >= min_band_size]
 
-
 def split_segments_by_bands(
     length: int,
     bands: List[Tuple[int, int]],
@@ -184,7 +171,6 @@ def split_segments_by_bands(
 
     return segments
 
-
 def manual_grid_split(image: np.ndarray, grid: str) -> List[ScreenCrop]:
     """Splits an image using a user-specified regular grid."""
     cols, rows = parse_grid(grid)
@@ -205,7 +191,6 @@ def manual_grid_split(image: np.ndarray, grid: str) -> List[ScreenCrop]:
             crops.append((x1, y1, x2 - x1, y2 - y1, crop))
 
     return crops
-
 
 def manual_layout_split(image: np.ndarray, layout: str) -> List[ScreenCrop]:
     """Splits an image using a user-specified uneven row layout."""
@@ -231,7 +216,6 @@ def manual_layout_split(image: np.ndarray, layout: str) -> List[ScreenCrop]:
             crops.append((x1, y1, x2 - x1, y2 - y1, crop))
 
     return crops
-
 
 def auto_split_by_white_gutters(image: np.ndarray) -> List[ScreenCrop]:
     """Automatically splits collages using visible white gutters."""
@@ -267,7 +251,6 @@ def auto_split_by_white_gutters(image: np.ndarray) -> List[ScreenCrop]:
         return [(0, 0, w, h, img)]
 
     return sort_screen_crops(crops)
-
 
 def contour_fallback_split(image: np.ndarray) -> List[ScreenCrop]:
     """Splits an image using contour boxes when gutters fail."""
@@ -326,7 +309,6 @@ def contour_fallback_split(image: np.ndarray) -> List[ScreenCrop]:
 
     return sort_screen_crops(crops)
 
-
 def sort_screen_crops(crops: List[ScreenCrop]) -> List[ScreenCrop]:
     """Orders screen crops from top-left to bottom-right."""
     if not crops:
@@ -354,14 +336,12 @@ def sort_screen_crops(crops: List[ScreenCrop]) -> List[ScreenCrop]:
 
     return ordered
 
-
 def minimal_ocr_clean(text: str) -> str:
     """Applies minimal cleanup to OCR text."""
     text = text.replace("\u200b", " ")
     text = text.replace("\ufeff", " ")
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
-
 
 def polygon_to_xywh(poly) -> Box:
     """Converts an OCR polygon into an x/y/width/height box."""
@@ -372,7 +352,6 @@ def polygon_to_xywh(poly) -> Box:
     y1, y2 = min(ys), max(ys)
 
     return x1, y1, x2 - x1, y2 - y1
-
 
 def looks_like_date(text: str) -> bool:
     """Checks whether text looks like a chat date label."""
@@ -394,7 +373,6 @@ def looks_like_date(text: str) -> bool:
 
     return False
 
-
 def looks_like_time(text: str) -> bool:
     """Checks whether text looks like an HH:MM time token."""
     t = text.strip()
@@ -402,11 +380,9 @@ def looks_like_time(text: str) -> bool:
     t = t.replace("*", ":").replace(",", ":").replace(";", ":").replace(".", ":")
     return bool(re.fullmatch(r"\d{1,2}:\d{2}", t))
 
-
 def looks_like_date_or_time(text: str) -> bool:
     """Checks whether text is a date label or time token."""
     return looks_like_date(text) or looks_like_time(text)
-
 
 def normalize_visible_time_token(text: str) -> Optional[str]:
     """Normalizes noisy OCR time text into HH:MM format."""
@@ -425,7 +401,6 @@ def normalize_visible_time_token(text: str) -> Optional[str]:
         return None
 
     return f"{hh:02d}:{mm:02d}"
-
 
 def parse_ocr_lines(ocr_data: str) -> List[Dict[str, str]]:
     """Parses positioned OCR debug text into row dictionaries."""
@@ -467,7 +442,6 @@ def parse_ocr_lines(ocr_data: str) -> List[Dict[str, str]]:
 
     return rows
 
-
 def extract_allowed_times_from_ocr(screen_ocr: str) -> Set[str]:
     """Collects visible bubble times from OCR output."""
     # Notes:
@@ -501,7 +475,6 @@ def extract_allowed_times_from_ocr(screen_ocr: str) -> Set[str]:
 
     return allowed
 
-
 def month_to_number(month: str) -> Optional[int]:
     """Maps an English month name to its numeric month value."""
     m = month.strip().lower()[:3]
@@ -521,14 +494,12 @@ def month_to_number(month: str) -> Optional[int]:
     }
     return table.get(m)
 
-
 def strip_code_fences(text: str) -> str:
     """Removes markdown code fences around model output."""
     text = text.strip()
     text = re.sub(r"^```(?:csv|json|text)?", "", text, flags=re.I).strip()
     text = re.sub(r"```$", "", text).strip()
     return text
-
 
 def extract_json_object(text: str) -> str:
     """Extracts the outermost JSON object from model text."""
@@ -541,7 +512,6 @@ def extract_json_object(text: str) -> str:
 
     return text[start:end + 1]
 
-
 def ollama_chat_text(model: str, prompt: str) -> str:
     """Sends a deterministic text-only prompt to Ollama."""
     response = ollama.chat(
@@ -550,7 +520,6 @@ def ollama_chat_text(model: str, prompt: str) -> str:
         options={"temperature": 0},
     )
     return response["message"]["content"].strip()
-
 
 def ollama_chat_screen(
     model: str,
@@ -583,16 +552,13 @@ def ollama_chat_screen(
 
         raise
 
-
 def normalize_phone(value: str) -> str:
     """Keeps only digits from a phone/contact string."""
     return re.sub(r"\D+", "", value or "")
 
-
 def normalize_name(value: str) -> str:
     """Lowercases and normalizes whitespace in a name."""
     return re.sub(r"\s+", " ", value or "").strip().lower()
-
 
 def clean_name(value: str) -> str:
     """Cleans display names before matching or output."""
@@ -601,11 +567,9 @@ def clean_name(value: str) -> str:
     value = re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
     return value
 
-
 def same_name(a: str, b: str) -> bool:
     """Compares two names after normalization."""
     return normalize_name(clean_name(a)) == normalize_name(clean_name(b))
-
 
 def name_in_text(name: str, text: str) -> bool:
     """Checks whether a normalized name appears inside normalized text."""
@@ -616,7 +580,6 @@ def name_in_text(name: str, text: str) -> bool:
         return False
 
     return name_norm in text_norm
-
 
 def build_actor_prompt(report_text: str) -> str:
     """Builds the fallback actor-extraction prompt."""
@@ -639,7 +602,6 @@ Rules:
 2. Include suspects/scammers and their contact numbers if present.
 3. Do not output explanations.
 """
-
 
 def infer_report_actors(report_text: str, model: str) -> Dict:
     """Extracts victim and suspect actors deterministically from the report."""
@@ -716,7 +678,6 @@ def infer_report_actors(report_text: str, model: str) -> Dict:
         "participants": participants
     }
 
-
 def infer_report_actors_fallback(report_text: str) -> Dict:
     """Extracts actors with simpler regex fallbacks."""
     victim = ""
@@ -754,7 +715,6 @@ def infer_report_actors_fallback(report_text: str) -> Dict:
         "victim": victim,
         "participants": participants,
     }
-
 
 def build_side_evidence(ocr_data: str) -> str:
     """Summarizes OCR text and phone-like strings by side."""
@@ -800,7 +760,6 @@ def build_side_evidence(ocr_data: str) -> str:
 
     return "\n".join(lines)
 
-
 def force_date_and_year(time_value: str, visible_date: str, default_year: int) -> str:
     """Normalizes timestamps and forces the visible screenshot date."""
     # Notes:
@@ -835,7 +794,6 @@ def force_date_and_year(time_value: str, visible_date: str, default_year: int) -
 
     return time_value
 
-
 def extract_hhmm_from_full_time(time_value: str) -> Optional[str]:
     # Accept both:
     # DD/MM/YYYY, HH:MM
@@ -852,7 +810,6 @@ def extract_hhmm_from_full_time(time_value: str) -> Optional[str]:
         return None
 
     return f"{hh:02d}:{mm:02d}"
-
 
 def strip_emojis(text: str) -> str:
     """Removes emoji and symbol ranges from message text."""
@@ -878,7 +835,6 @@ def strip_emojis(text: str) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 def normalize_text_for_side_overlap(text: str) -> Set[str]:
     """Tokenizes text for fuzzy side-overlap matching."""
     # Notes:
@@ -889,12 +845,415 @@ def normalize_text_for_side_overlap(text: str) -> Set[str]:
     t = re.sub(r"[^a-z0-9]+", " ", t)
     return {w for w in t.split() if len(w) >= 2}
 
-
 def count_data_rows(side_csv: str) -> int:
     """Counts non-header data rows in a side CSV."""
     rows = list(csv.reader(io.StringIO(strip_code_fences(side_csv))))
     return sum(1 for r in rows if r and len(r) >= 3 and r[0].strip().lower() != "time")
 
+def remove_leaked_time_tokens_from_message(message: str) -> str:
+    """Remove standalone HH:MM-like tokens accidentally copied into message text."""
+    text = str(message or "")
+    # Remove times such as 08:16, 11,01 or 10.32 when they are standalone OCR leaks.
+    text = re.sub(r"(?<![A-Za-z0-9])\d{1,2}[:.,;]\d{2}(?![A-Za-z0-9])", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def looks_like_noisy_ocr_text(message: str) -> bool:
+    """Detect OCR-heavy text that should not be trusted as final transcript text."""
+    text = str(message or "")
+    if not text.strip():
+        return True
+
+    # Standalone leaked timestamps are a strong signal that OCR text crossed bubble boundaries.
+    if re.search(r"(?<![A-Za-z0-9])\d{1,2}[:.,;]\d{2}(?![A-Za-z0-9])", text):
+        return True
+
+    # Too many OCR-only artifacts for one message.
+    artifact_patterns = [
+        r"\bTII\w*\b",
+        r"\bI{2}l\b",
+        r"\b1['’]?I[lI]\b",
+        r"\bJi00\b",
+        r"\$",
+        r"\|",
+        r"__",
+        r"=",
+        r"\byoU\b",
+        r"\bsO\b",
+    ]
+    hits = sum(1 for pat in artifact_patterns if re.search(pat, text))
+    return hits >= 2
+
+def conservative_clean_message_text(message: str) -> str:
+    """Apply generic OCR cleanup without semantic rewriting or case-specific replacements."""
+    msg = str(message or "").strip()
+
+    msg = msg.replace('\\"', '"')
+    msg = msg.replace("“", '"').replace("”", '"')
+    msg = msg.replace("‘", "'").replace("’", "'")
+    msg = msg.replace("\u200b", " ").replace("\ufeff", " ")
+
+    msg = remove_leaked_time_tokens_from_message(msg)
+
+    pronoun_verbs = (
+        r"am|was|will|can|can't|cannot|need|have|think|feel|want|would|could|"
+        r"should|do|don't|dont|love|trust|promise|know|hope|wish|believe|already|"
+        r"just|may|must|might|see|ask|tell|try|send|keep|call|go|complete|look|admire"
+    )
+    msg = re.sub(
+        rf"(?i)(^|[\s,.;:!?])\|\s+({pronoun_verbs})\b",
+        lambda m: f"{m.group(1)}I {m.group(2)}",
+        msg,
+    )
+
+    compact_i = {
+        "just": "just",
+        "will": "will",
+        "need": "need",
+        "love": "love",
+        "may": "may",
+        "feel": "feel",
+        "already": "already",
+        "cant": "can't",
+        "can't": "can't",
+        "can": "can",
+        "have": "have",
+        "think": "think",
+        "want": "want",
+        "would": "would",
+        "could": "could",
+        "should": "should",
+        "promise": "promise",
+        "believe": "believe",
+        "hope": "hope",
+        "see": "see",
+    }
+    for compact, word in compact_i.items():
+        msg = re.sub(rf"\bI{re.escape(compact)}\b", f"I {word}", msg, flags=re.IGNORECASE)
+
+    msg = re.sub(r"\bI\s*m\b", "I'm", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bIm\b", "I'm", msg)
+    msg = re.sub(r"\bTm\b", "I'm", msg)
+    msg = re.sub(r"\bI\s*ve\b", "I've", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bFve\b", "I've", msg)
+    msg = re.sub(r"\bI\s*ll\b", "I'll", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bIll\b", "I'll", msg)
+    msg = re.sub(r"\bIIl\b", "I'll", msg)
+    msg = re.sub(r"\b1['’]?I[lI]\b", "I'll", msg)
+    msg = re.sub(r"\b1['’]?ll\b", "I'll", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bTII\s*keep\b", "I'll keep", msg, flags=re.IGNORECASE)
+
+    msg = re.sub(r"\b([A-Za-z]+)'\$\b", r"\1's", msg)
+    msg = re.sub(r"\bit\$\b", "it's", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bthat\$\b", "that's", msg, flags=re.IGNORECASE)
+
+    msg = re.sub(r"\b([Ii])t\s*[\"]+\s*s\b", "It's", msg)
+    msg = re.sub(r"\b([Tt])hat\s*[\"]+\s*s\b", "That's", msg)
+    msg = re.sub(r"\b([Dd])on\s*[\"]+\s*t\b", "don't", msg)
+    msg = re.sub(r"\b([Cc])an\s*[\"]+\s*t\b", "can't", msg)
+
+    msg = re.sub(r"\bIcant\b", "I can't", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bIcan't\b", "I can't", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bdont\b", "don't", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\byoure\b", "you're", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bthats\b", "that's", msg, flags=re.IGNORECASE)
+    msg = re.sub(r"\bits\b", "it's", msg)
+
+    msg = re.sub(r"\bsO\b", "so", msg)
+    msg = re.sub(r"\byoU\b", "you", msg)
+    msg = re.sub(r"\bJi00\b", "I", msg)
+    msg = re.sub(r"\bIı\b", "I", msg)
+
+    msg = msg.replace("=", " ")
+    msg = msg.replace("__", "...")
+    msg = msg.replace("_", "")
+
+    label_like = (
+        r"name|country|city|option|account|iban|reference|mtcn|phone|email|"
+        r"amount|details|receiver|sender|beneficiary|bank|address|code|number|date|time"
+    )
+    has_structured_label = re.search(rf"\b({label_like})\s*:", msg, flags=re.IGNORECASE)
+    if not has_structured_label:
+        msg = re.sub(
+            r";\s+(?=(I|I'm|I'll|you|we|it|that|this|the|they|there|but|and|more|please|thank)\b)",
+            ", ",
+            msg,
+            flags=re.IGNORECASE,
+        )
+        msg = re.sub(
+            r":\s+(?=(I|I'm|I'll|you|we|it|that|this|the|they|there|but|and|because|so|please|thank)\b)",
+            ". ",
+            msg,
+            flags=re.IGNORECASE,
+        )
+
+    msg = msg.replace(":_.", "...").replace(":-", "...").replace("_.", "...")
+    msg = re.sub(r"\.{4,}", "...", msg)
+    msg = re.sub(r"\s+", " ", msg).strip()
+    msg = re.sub(r"\s+([,.;:!?])", r"\1", msg)
+    msg = re.sub(r"([,.;:!?])(?=[A-Za-z])", r"\1 ", msg)
+    msg = re.sub(r"\s+\.\.\.", "...", msg)
+
+    if msg.endswith(":") and not re.search(rf"\b({label_like})\s*:$", msg, flags=re.IGNORECASE):
+        if len(re.findall(r"\b\w+\b", msg)) >= 4:
+            msg = msg[:-1] + "."
+
+    return msg.strip()
+
+def _side_csv_rows(side_csv: str) -> List[List[str]]:
+    """Read Time/Side/Message rows from a side CSV."""
+    rows: List[List[str]] = []
+    reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
+    for row in reader:
+        if not row:
+            continue
+        if len(row) >= 3 and row[0].strip().lower() == "time":
+            continue
+        if len(row) < 3:
+            continue
+        time_value = row[0].strip()
+        side = row[1].strip().upper()
+        message = ",".join(row[2:]).strip() if len(row) > 3 else row[2].strip()
+        if time_value and side in {"LEFT", "RIGHT"} and message:
+            rows.append([time_value, side, message])
+    return rows
+
+def normalize_message_for_similarity(message: str) -> str:
+    """Normalize message text for duplicate/continuation checks only."""
+    text = strip_emojis(str(message or ""))
+    text = text.replace("’", "'").replace("‘", "'")
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def message_similarity_ratio(a: str, b: str) -> float:
+    """Return a generic similarity ratio for two message strings."""
+    a_norm = normalize_message_for_similarity(a)
+    b_norm = normalize_message_for_similarity(b)
+    if not a_norm and not b_norm:
+        return 1.0
+    if not a_norm or not b_norm:
+        return 0.0
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
+
+def _datetime_from_side_time(time_value: str):
+    """Parse transcript timestamp strings when possible."""
+    from datetime import datetime
+    text = str(time_value or "").strip()
+    for fmt in ("%d/%m/%Y %H:%M", "%d/%m/%Y, %H:%M", "%d/%m/%Y,%H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+def _minutes_apart(a: str, b: str) -> Optional[float]:
+    """Return absolute minute difference between two row timestamps."""
+    da = _datetime_from_side_time(a)
+    db = _datetime_from_side_time(b)
+    if da is None or db is None:
+        return None
+    return abs((da - db).total_seconds()) / 60.0
+
+def _same_day(a: str, b: str) -> bool:
+    """Check if two timestamp strings share the same DD/MM/YYYY prefix."""
+    return str(a or "")[:10] == str(b or "")[:10]
+
+def _message_quality_score(message: str) -> Tuple[int, int, int]:
+    """Prefer fuller, cleaner messages when removing near duplicates."""
+    text = str(message or "").strip()
+    words = normalize_message_for_similarity(text).split()
+    terminal = 1 if re.search(r"[.!?…]$", text) else 0
+    odd = len(re.findall(r"[^\w\s,.;:!?€£$+@%/'\"()\-]", text))
+    return (len(words), len(text), terminal - odd)
+
+def are_near_duplicate_messages(a: str, b: str) -> bool:
+    """Detect adjacent duplicates with minor OCR/VLM differences."""
+    a_norm = normalize_message_for_similarity(a)
+    b_norm = normalize_message_for_similarity(b)
+    if not a_norm or not b_norm:
+        return False
+
+    if a_norm == b_norm:
+        return True
+
+    shorter, longer = sorted([a_norm, b_norm], key=len)
+    if len(shorter.split()) >= 4 and shorter in longer:
+        return True
+
+    ratio = SequenceMatcher(None, a_norm, b_norm).ratio()
+    return ratio >= 0.88
+
+def looks_like_orphan_fragment_message(message: str) -> bool:
+    """Detect likely OCR/VLM fragments that should trigger repair or cautious merge."""
+    raw = str(message or "").strip()
+    if not raw:
+        return False
+
+    text = strip_emojis(raw).strip()
+    words = re.findall(r"[A-Za-z']+", text)
+    if not words:
+        return False
+
+    first = words[0].lower().strip("'")
+    word_count = len(words)
+    starts_lower = bool(text[:1].islower())
+
+    if starts_lower and "?" in text and word_count <= 8:
+        return True
+
+    fragment_starts = {
+        "and", "but", "because", "so", "that", "which", "with", "without",
+        "for", "to", "of", "in", "on", "at", "by", "from", "as", "than",
+        "my", "your", "our", "their", "the", "a", "an", "there", "then", "right",
+    }
+    if starts_lower and first in fragment_starts and word_count <= 8:
+        return True
+
+    if re.search(r"\b[a-z]{2,}\s+(The|I|I'm|I'll|You|We|They)\b", text) and word_count <= 12:
+        return True
+
+    return False
+
+def should_merge_continuation(prev_message: str, message: str) -> bool:
+    """Conservatively merge only wrapped-line fragments, not normal adjacent bubbles."""
+    prev = str(prev_message or "").strip()
+    cur = str(message or "").strip()
+    if not prev or not cur:
+        return False
+
+    cur_words = re.findall(r"[A-Za-z0-9']+", cur)
+    if not cur_words:
+        return False
+
+    prev_finished = bool(re.search(r"[.!?…]$", prev))
+    first = re.sub(r"[^A-Za-z']+", "", cur_words[0]).lower()
+    starts_lower = bool(cur[:1].islower())
+
+    # Never merge a lowercase-start question into a previous completed message;
+    # it is suspicious and should be repaired/reordered from the image instead.
+    if starts_lower and "?" in cur:
+        return False
+
+    continuation_starts = {
+        "and", "but", "because", "so", "that", "which", "with", "without",
+        "for", "to", "of", "in", "on", "at", "by", "from", "as", "than",
+        "my", "your", "our", "their", "the", "a", "an", "better", "communication"
+    }
+
+    # A current row after an unfinished previous row can be a wrapped line even if
+    # it has more than three words. Keep the limit modest to avoid merging bubbles.
+    if not prev_finished and len(cur_words) <= 8:
+        if starts_lower or first in continuation_starts:
+            return True
+
+    # Tiny fragments are safe to absorb when the previous row is unfinished.
+    if not prev_finished and len(cur_words) <= 3:
+        return True
+
+    # Previous row ending with comma/colon/semicolon can absorb a tiny continuation.
+    if len(cur_words) <= 2 and re.search(r"[,;:]$", prev) and first not in {"yes", "no", "ok", "okay"}:
+        return True
+
+    return False
+
+def split_side_row_by_known_boundaries(row: List[str]) -> List[List[str]]:
+    """Return a cleaned side-CSV row without dataset-specific transcript rewrites."""
+    time_value, side, message = row
+    msg = conservative_clean_message_text(message)
+    if not msg:
+        return []
+    return [[time_value, side, msg]]
+
+def postprocess_side_csv_rows(side_csv: str) -> str:
+    """Generic side-CSV cleanup: near-duplicate removal and safe continuation merges."""
+    rows = []
+    for _row in _side_csv_rows(side_csv):
+        rows.extend(split_side_row_by_known_boundaries(_row))
+
+    # First remove exact and adjacent near duplicates.
+    deduped: List[List[str]] = []
+    seen_exact = set()
+    for row in rows:
+        item = tuple(row)
+        if item in seen_exact:
+            continue
+        seen_exact.add(item)
+
+        if deduped:
+            prev = deduped[-1]
+            close_time = _minutes_apart(prev[0], row[0])
+            close_enough = close_time is None or close_time <= 2
+            if prev[1] == row[1] and _same_day(prev[0], row[0]) and close_enough and are_near_duplicate_messages(prev[2], row[2]):
+                if _message_quality_score(row[2]) > _message_quality_score(prev[2]):
+                    # Keep the better text but preserve the earlier timestamp.
+                    deduped[-1] = [prev[0], prev[1], row[2]]
+                continue
+        deduped.append(row)
+
+    # Then merge obvious wrapped/fragments from the same side.
+    merged: List[List[str]] = []
+    for row in deduped:
+        if merged:
+            prev = merged[-1]
+            close_time = _minutes_apart(prev[0], row[0])
+            close_enough = close_time is None or close_time <= 1
+            if prev[1] == row[1] and _same_day(prev[0], row[0]) and close_enough and should_merge_continuation(prev[2], row[2]):
+                prev[2] = conservative_clean_message_text(prev[2] + " " + row[2])
+                continue
+        row[2] = conservative_clean_message_text(row[2])
+        merged.append(row)
+
+    out = io.StringIO()
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerow(["Time", "Side", "Message"])
+
+    final_seen = set()
+    for row in merged:
+        item = tuple(row)
+        if item in final_seen:
+            continue
+        final_seen.add(item)
+        writer.writerow(row)
+
+    return out.getvalue().strip() + "\n"
+
+def side_csv_needs_repair(side_csv: str, expected_bubble_count: int = 0) -> bool:
+    """Detect whether a screen CSV needs a second VLM repair pass."""
+    rows = _side_csv_rows(side_csv)
+    row_count = len(rows)
+
+    if row_count == 0:
+        return True
+
+    if expected_bubble_count > 0:
+        # A one-row difference is common from OCR UI noise, but larger gaps indicate split/merge trouble.
+        if abs(row_count - expected_bubble_count) >= 2:
+            return True
+
+    suspicious_fragment_count = 0
+
+    for i, row in enumerate(rows):
+        message = row[2]
+        if re.search(r"\b\d{1,2}[:.,;]\d{2}\b", message):
+            return True
+        if looks_like_orphan_fragment_message(message):
+            suspicious_fragment_count += 1
+            return True
+        if len(message) >= 220 and re.search(r"[.!?].+\b(I|You|We|They|Please|Thank|The|There)\b", message):
+            return True
+        # Suspicious OCR word-order: lowercase token before a new capitalized start.
+        if re.search(r"\b(they|can|the|and|but)\s+(The|I|I'm|I'll|You|We|They)\b", message):
+            return True
+        if i > 0:
+            prev = rows[i - 1]
+            if prev[1] == row[1] and _same_day(prev[0], row[0]) and are_near_duplicate_messages(prev[2], message):
+                return True
+            close_time = _minutes_apart(prev[0], row[0])
+            if prev[1] == row[1] and (close_time is None or close_time <= 1) and should_merge_continuation(prev[2], message):
+                return True
+
+    return False
 
 def merge_side_csvs(csv_parts: List[str]) -> str:
     """Merges per-screen side CSV parts while removing exact duplicates."""
@@ -933,7 +1292,6 @@ def merge_side_csvs(csv_parts: List[str]) -> str:
             writer.writerow(item)
 
     return out.getvalue().strip() + "\n"
-
 
 def apply_side_mapping(side_csv: str, side_map: Dict[str, str]) -> str:
     """Converts LEFT/RIGHT side rows into Sender/Receiver rows."""
@@ -975,12 +1333,10 @@ def apply_side_mapping(side_csv: str, side_map: Dict[str, str]) -> str:
 
     return out.getvalue().strip() + "\n"
 
-
 def write_crop(path: Path, crop: np.ndarray) -> None:
     """Writes an image crop to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), crop)
-
 
 def choose_best_screen_side_csv(
     draft_norm: str,

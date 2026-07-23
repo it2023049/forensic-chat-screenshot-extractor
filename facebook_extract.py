@@ -1,14 +1,12 @@
 """Facebook Messenger screenshot-to-CSV extractor."""
 
-# Short summary:
-# This script extracts chat messages from screenshot images/collages into CSV.
-# It uses OCR for text/position hints and Ollama/VLM calls for final reconstruction.
 import sys
 import re
 import csv
 import io
 import json
 import argparse
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -18,12 +16,9 @@ import easyocr
 import ollama
 from PyPDF2 import PdfReader
 
-
-# Common geometry aliases used by OCR and crop splitting helpers.
 Box = Tuple[int, int, int, int]
 ScreenCrop = Tuple[int, int, int, int, np.ndarray]
 
-# Shared helpers keep duplicated Facebook/Viber logic in one module.
 from extractor_utils import (
     extract_text_from_report,
     extract_year_from_report,
@@ -69,40 +64,15 @@ from extractor_utils import (
     apply_side_mapping,
     write_crop,
     choose_best_screen_side_csv,
+    conservative_clean_message_text,
+    postprocess_side_csv_rows,
+    side_csv_needs_repair,
+    looks_like_orphan_fragment_message,
 )
-
-
-
-# ============================================================
-# FILE / REPORT READING
-# ============================================================
-
-
-
-
 
 # ============================================================
 # IMAGE / COLLAGE SPLITTING
 # ============================================================
-
-# Parses manual grid layouts such as 2x1 or 3x2.
-
-
-# Parses uneven collage row layouts such as 2,3.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def separator_score_y(gray: np.ndarray, y: int, band: int = 3) -> float:
     """Scores a horizontal split candidate for wide phone collages."""
     h, w = gray.shape[:2]
@@ -113,16 +83,8 @@ def separator_score_y(gray: np.ndarray, y: int, band: int = 3) -> float:
     diff = np.abs(gray[y - 1, :].astype(int) - gray[y + 1, :].astype(int)).mean() / 255.0
     return float(white + dark + diff)
 
-
 def auto_split_wide_phone_collage(image: np.ndarray) -> List[ScreenCrop]:
     """Splits wide phone screenshot collages into individual screens."""
-    # Notes:
-    # Handles both:
-    # - one-row side-by-side collages, e.g. 2 screenshots next to each other
-    # - multi-row collages, e.g. 4 screenshots on top and 4 screenshots below
-    #
-    # This is deliberately conservative for single portrait screenshots:
-    # if the full image is not wide enough, it is not split.
     img = trim_white_border(image)
     h, w = img.shape[:2]
 
@@ -144,9 +106,7 @@ def auto_split_wide_phone_collage(image: np.ndarray) -> List[ScreenCrop]:
     # the same global aspect ratio. We therefore look for a horizontal row
     # boundary near the middle.
     #
-    # For generated Messenger collages, the safest split is often exactly at
-    # half height. White-band detection alone can be fooled by blank areas
-    # inside the lower row and may split too low, producing 5 crops in row 2.
+    # For clean multi-row collages, a middle split is often the safest fallback.
     # ------------------------------------------------------------
     row_segments = [(0, h)]
 
@@ -218,15 +178,6 @@ def auto_split_wide_phone_collage(image: np.ndarray) -> List[ScreenCrop]:
 
     return sort_screen_crops(crops)
 
-
-
-
-
-
-
-
-
-
 # Main crop splitter: manual options first, then automatic fallbacks.
 def get_screen_crops(
     image_path: str,
@@ -270,23 +221,9 @@ def get_screen_crops(
 
     return contour_crops
 
-
 # ============================================================
 # OCR WITH POSITIONED BLOCKS
 # ============================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
 def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
     """Classifies an OCR box as LEFT, RIGHT, or CENTER by geometry."""
     x, y, bw, bh = bbox
@@ -302,7 +239,6 @@ def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
         return "RIGHT"
 
     return "LEFT"
-
 
 def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
     """Corrects OCR side labels for fragments on the same visual line."""
@@ -358,7 +294,7 @@ def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
         min_x = min(b["x"] for b in line)
 
         # If a visual line starts on the left, the whole line belongs to a LEFT bubble.
-        # A real RIGHT purple bubble should not have any text starting this far left.
+        # A real right-side bubble should not have any text starting this far left.
         if min_x < crop_w * 0.35:
             for b in line:
                 b["pos"] = "LEFT"
@@ -367,7 +303,6 @@ def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
                 b["pos"] = "RIGHT"
 
     return blocks
-
 
 # Runs EasyOCR and keeps each text block with side/position metadata.
 def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
@@ -440,17 +375,9 @@ def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
 
     return "\n".join(lines)
 
-
 # ============================================================
 # OCR PARSING / SCREEN TIME LIMITS
 # ============================================================
-
-
-
-
-
-
-
 def extract_visible_date_from_ocr(
     screen_ocr: str,
     default_year: int,
@@ -521,7 +448,6 @@ def extract_visible_date_from_ocr(
 
     return ""
 
-
 def infer_visible_date_with_ai(
     model: str,
     image_path: str,
@@ -571,40 +497,9 @@ Rules:
 
     return ""
 
-
-# ============================================================
-# LLM HELPERS
-# ============================================================
-
-
-
-
-
-
-
-
-
 # ============================================================
 # REPORT ACTORS + SIDE MAP
 # ============================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def find_header_match(ocr_data: str, actors: Dict) -> str:
     """Matches top header OCR against known report actors."""
     # Notes:
@@ -661,10 +556,6 @@ def find_header_match(ocr_data: str, actors: Dict) -> str:
         return ""
 
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[0][0]
-
-
-
-
 
 def deterministic_messenger_side_map(
     actors: Dict,
@@ -758,8 +649,6 @@ def deterministic_messenger_side_map(
 
     return None
 
-
-
 def build_side_map_prompt(
     report_text: str,
     actors: Dict,
@@ -793,8 +682,6 @@ Rules:
 5. If the header/contact is a suspect and the victim is the screenshot owner, map LEFT=suspect and RIGHT=victim.
 6. Do not output explanations.
 """
-
-
 
 # Builds the final LEFT/RIGHT speaker mapping before CSV conversion.
 def infer_side_mapping(
@@ -835,11 +722,9 @@ def infer_side_mapping(
         "RIGHT": right,
     }
 
-
 # ============================================================
 # SCREEN EXTRACTION PROMPTS
 # ============================================================
-
 def build_messenger_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
     """Groups Messenger OCR blocks into approximate chat bubbles."""
     # Notes:
@@ -947,10 +832,10 @@ def build_messenger_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
             groups.append({
                 "side": side,
                 "text": text,
+                "order": len(groups),
             })
 
     return groups
-
 
 def build_messenger_bubble_hints(screen_ocr: str) -> str:
     """Formats Messenger OCR bubble groups as prompt hints."""
@@ -967,8 +852,6 @@ def build_messenger_bubble_hints(screen_ocr: str) -> str:
         lines.append(f"[BUBBLE {i}] SIDE={group.get('side', '')} OCR_TEXT={group.get('text', '')}")
 
     return "\n".join(lines)
-
-
 
 def build_screen_prompt(
     screen_ocr: str,
@@ -988,7 +871,7 @@ def build_screen_prompt(
 
     return f"""
 You are extracting messages from ONE Facebook Messenger screenshot image.
-Use the attached image as the primary source. Use OCR blocks only as support.
+Use the attached image as the primary source. Use OCR blocks only as support for side, visible date/time, and bubble boundaries. OCR text can be noisy; do not copy OCR word-order artifacts when the image is clearer.
 
 SCREEN INDEX: {screen_index}
 VISIBLE DATE FOR THIS SCREEN: {visible_date or "unknown - read it from the central Messenger date separator in the screenshot"}
@@ -1013,27 +896,26 @@ Rules:
 6. Reconstruct each separate visible rounded chat bubble as one CSV row. Do not output one row per OCR line.
 7. Messenger often shows one central date/time separator for many bubbles. Do NOT merge all bubbles after the same timestamp into one message.
 8. Never merge two adjacent bubbles just because they have the same sender, same side, or same visible timestamp. If there is a separate rounded bubble boundary, it is a separate CSV row.
-9. Use MESSENGER BUBBLE HINTS as a guide for splitting: normally each [BUBBLE n] should become one CSV row unless it is clearly UI noise.
-10. Before the final CSV, compare your rows with MESSENGER BUBBLE HINTS and the screenshot. If a visible human bubble is missing, add it in the correct visual/top-to-bottom order, not at the end.
-11. Do not add OCR fragments that duplicate an existing row, even if the OCR wording is noisier.
-12. Do not drop the last visible chat bubble near the bottom of the screenshot. A blue/gray rounded bubble above the composer/input bar is still a human message.
-13. If one bubble wraps across multiple OCR lines, merge only the lines inside that same rounded bubble.
-11. If a bubble has no individual timestamp, use the screen's visible date/time separator as the starting time, then infer monotonically increasing per-message times for later bubbles in the same visible sequence. Do not repeat the exact same timestamp for every bubble unless the screenshot clearly shows they share that exact minute.
+9. Use MESSENGER BUBBLE HINTS as a guide for split boundaries and visual order: normally each [BUBBLE n] should become one CSV row unless it is clearly UI noise. Use the image, not noisy OCR text, for final message wording.
+10. The output rows must follow the exact visible top-to-bottom order of rounded bubbles in the screenshot. When several rows reuse the same central Messenger timestamp, never reorder them by text meaning or by timestamp; keep visual order.
+11. Before the final CSV, compare your rows with MESSENGER BUBBLE HINTS and the screenshot. If a visible human bubble is missing, add it in the correct visual/top-to-bottom order, not at the end.
+12. Do not add OCR fragments that duplicate an existing row, even if the OCR wording is noisier.
+13. Do not drop the last visible chat bubble near the bottom of the screenshot. A blue/gray rounded bubble above the composer/input bar is still a human message.
+14. If one bubble wraps across multiple OCR lines, merge only the lines inside that same rounded bubble; do not output wrapped lines as separate CSV rows.
+15. If a draft row starts with a lowercase fragment or has a question in reversed order, re-read that visible bubble from the screenshot and place it where the bubble appears.
+11. If a bubble has no individual timestamp, use the visible Messenger screen/date-time separator timestamp for that bubble. Do not fabricate per-message minute offsets.
 12. OCR COVERAGE CHECK: Every non-UI LEFT/RIGHT OCR text block must be represented in an output message, but grouped by visible bubble boundaries.
 12. Do not shorten messages. Do not keep only the first line of a bubble.
 13. Emoji rule: {emoji_rule}
 14. Preserve evidence exactly: amounts, names, countries, cities, receiver details, phone numbers, account/payment details, reference numbers, threats, instructions.
-15. Time must be the bubble's visible time when present. When individual bubble times are hidden, estimate a plausible monotonically increasing time from the screen's visible date/time separator, combined with VISIBLE DATE FOR THIS SCREEN. Format: "DD/MM/YYYY HH:MM".
+15. Time must be the bubble's visible time when present. When individual bubble times are hidden, reuse the visible Messenger screen/date-time separator timestamp combined with VISIBLE DATE FOR THIS SCREEN. Format: "DD/MM/YYYY HH:MM".
 16. Only use times from ALLOWED BUBBLE TIMES FOR THIS SCREEN when they are available. Do not use the status bar time.
-17. Fix only obvious OCR mistakes when the image clearly supports it: Im -> I'm, Icant -> I can't, | -> I, $ -> s, trailing ":" or "_" as punctuation.
+17. Fix only obvious OCR mistakes when the image clearly supports it: Im -> I'm, Icant -> I can't, IIl/1'Il -> I'll, Ijust -> I just, Iwill -> I will, Ilove -> I love, | -> I, $ -> s, and remove leaked HH:MM tokens from message text.
 18. Do not invent, summarize, or add messages from other screenshots.
 19. Use exactly three quoted CSV fields per row. No markdown, no explanations.
 
 Final CSV:
 """
-
-
-
 
 def build_screen_repair_prompt(
     draft_csv: str,
@@ -1079,8 +961,9 @@ Rules:
 4. Side must be LEFT or RIGHT based on visible bubble position/color. LEFT = gray incoming. RIGHT = blue outgoing. Do not output names.
 5. Messenger often shows one central date/time separator for many bubbles. Do NOT merge all bubbles after the same timestamp into one message.
 6. Keep each separate visible rounded chat bubble as one CSV row, even if adjacent bubbles have the same sender, same side, or same visible timestamp.
-7. Use MESSENGER BUBBLE HINTS as a guide for splitting: normally each [BUBBLE n] should become one CSV row unless it is clearly UI noise.
-8. Before the final CSV, compare your rows with MESSENGER BUBBLE HINTS and the screenshot. If a visible human bubble is missing, add it in the correct visual/top-to-bottom order, not at the end.
+7. Use MESSENGER BUBBLE HINTS as a guide for split boundaries and visual order: normally each [BUBBLE n] should become one CSV row unless it is clearly UI noise. Use the image, not noisy OCR text, for final message wording.
+8. The output rows must follow the exact visible top-to-bottom order of rounded bubbles in the screenshot. When several rows reuse the same central Messenger timestamp, never reorder them by text meaning or by timestamp; keep visual order.
+9. Before the final CSV, compare your rows with MESSENGER BUBBLE HINTS and the screenshot. If a visible human bubble is missing, add it in the correct visual/top-to-bottom order, not at the end.
 9. Do not add OCR fragments that duplicate an existing row, even if the OCR wording is noisier.
 10. Do not drop the last visible chat bubble near the bottom of the screenshot. A blue/gray rounded bubble above the composer/input bar is still a human message.
 11. If the draft merged two or more visible bubbles into one row, split them back into separate rows using the screenshot.
@@ -1089,7 +972,7 @@ Rules:
 10. Do not shorten messages. Do not keep only the first line of a bubble.
 11. Emoji rule: {emoji_rule}
 12. Merge wrapped lines only when they are inside the same visible rounded bubble.
-13. Use visible bubble/screen times as anchors. If Messenger hides individual bubble times, infer plausible monotonically increasing per-message times instead of repeating the same anchor time for all rows.
+13. Use visible bubble/screen times as anchors. If Messenger hides individual bubble times, reuse the same visible anchor time for those bubbles instead of inventing minute offsets.
 14. If VISIBLE DATE FOR THIS SCREEN is unknown, read the central Messenger date separator from the screenshot image. Never reuse a date from another screenshot.
 15. Combine each time with VISIBLE DATE FOR THIS SCREEN or the date read from the screenshot. Format: "DD/MM/YYYY HH:MM".
 16. Preserve evidence: amounts, names, receiver details, locations, phone numbers, accounts, references, threats, instructions.
@@ -1099,16 +982,9 @@ Rules:
 Final CSV:
 """
 
-
-
 # ============================================================
 # CSV NORMALIZATION
 # ============================================================
-
-
-
-
-
 def is_ui_message(message: str) -> bool:
     """Detects platform UI text that should not become a chat row."""
     # Notes:
@@ -1166,217 +1042,9 @@ def is_ui_message(message: str) -> bool:
 
     return False
 
-
-
 def clean_message_text(message: str) -> str:
-    """Applies conservative OCR and punctuation cleanup to messages."""
-    # Notes:
-    # No case-specific names, phone numbers, or emoji substitutions are used here.
-    # This function only applies pattern-based OCR cleanup that is broadly useful.
-    msg = str(message or "").strip()
-
-    # CSV/quote cleanup.
-    msg = msg.replace('\\"', "'")
-    msg = msg.replace('""', "'")
-    msg = msg.replace('"', "'")
-    msg = msg.replace("“", "'")
-    msg = msg.replace("”", "'")
-
-    # Generic OCR artifact: word+'$ usually means word+'s.
-    msg = re.sub(r"\b([A-Za-z]+)'\$", r"\1's", msg)
-
-    # Remove obvious non-word OCR separators inside a sentence.
-    msg = re.sub(r"\s+=\s+", " ", msg)
-
-    # Generic English contraction/OCR fixes.
-    msg = re.sub(r"\bIm\b", "I'm", msg)
-    msg = re.sub(r"\bI\s*m\b", "I'm", msg)
-    msg = re.sub(r"\bTm\b", "I'm", msg)
-    msg = re.sub(r"\bT\s*m\b", "I'm", msg)
-    msg = re.sub(r"\bFve\b", "I've", msg)
-    msg = re.sub(r"\bIve\b", "I've", msg)
-    msg = re.sub(r"\bIcant\b", "I can't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIcan't\b", "I can't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bdontt\b", "don't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bdont\b", "don't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIll\b", "I'll", msg)
-    msg = re.sub(r"\bI\s*ll\b", "I'll", msg)
-    msg = re.sub(r"\bIwill\b", "I will", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIfeel\b", "I feel", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIdo\b", "I do", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIlook\b", "I look", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIadmire\b", "I admire", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bt0\b", "to", msg, flags=re.IGNORECASE)
-
-    # Common OCR word-shape errors in short chat prose.
-    msg = re.sub(r"\bsO\b", "so", msg)
-    msg = re.sub(r"\buS\b", "us", msg)
-    msg = re.sub(r"\bteel\b", "I feel", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\btool\b(?=($|[\s.!?,]))", "too!", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bcours\b", "course", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bpasse\b", "passed", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bThave\b", "I have", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bwomar\b", "woman", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bdoing how you re\b", "how you're doing", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bthe you handle\b", "the way you handle", msg, flags=re.IGNORECASE)
-
-    # OCR sometimes reads final exclamation mark as lowercase l.
-    final_l_words = r"(love|angel|Mary|Michael|it|there|you|too)"
-    msg = re.sub(rf"\b{final_l_words}l\b(?=$|[\s.!?,])", lambda m: m.group(0)[:-1] + "!", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bMichaell\b", "Michael!", msg, flags=re.IGNORECASE)
-
-    # OCR sometimes reads pronoun I as | or !. Convert only in obvious contexts.
-    pronoun_verbs = (
-        r"am|was|will|can|cannot|can't|need|have|think|feel|want|would|could|"
-        r"should|do|don't|dont|almost|love|trust|promise|already|may|must|might|"
-        r"know|hope|dream|see|believe|wish|tell|always|ask|slept"
-    )
-    msg = re.sub(
-        rf"(?i)(^|[\s,.;:!?])\|\s+({pronoun_verbs})\b",
-        lambda m: f"{m.group(1)}I {m.group(2)}",
-        msg
-    )
-    msg = re.sub(
-        rf"(?i)(^|[\s,.;:!?])!\s+({pronoun_verbs})\b",
-        lambda m: f"{m.group(1)}I {m.group(2)}",
-        msg
-    )
-    msg = re.sub(
-        r"(?i)\b(and|but|that|if|when|because|so)\s+\|\s+",
-        lambda m: f"{m.group(1)} I ",
-        msg
-    )
-
-    # Missing initial "I" in common first-person OCR cases.
-    msg = re.sub(r"(?i)^feel\s+(?=(I\s+can|a\s+deep|our\s+connection|the\s+same)\b)", "I feel ", msg)
-    msg = re.sub(r"(?i)^don't\s+usually\b", "I don't usually", msg)
-    msg = re.sub(r"(?i)^dream\s+about\b", "I dream about", msg)
-    msg = re.sub(r"(?i)^will\s+do\b", "I will do", msg)
-    msg = re.sub(r"(?i)^hope\s+it\b", "I hope it", msg)
-    msg = re.sub(r"(?i)^see\s+my\s+future\b", "I see my future", msg)
-    msg = re.sub(r"(?i)^love\s+you\b", "I love you", msg)
-    msg = re.sub(r"(?i)^slept\s+well\b", "I slept well", msg)
-
-    # Common first-person continuations after sentence punctuation.
-    msg = re.sub(r"(?i)([.!?]\s+)will\s+(do|try|send|message|keep|call)\b", r"\1I will \2", msg)
-    msg = re.sub(r"(?i)([.!?]\s+)hope\s+(it|you|we)\b", r"\1I hope \2", msg)
-    msg = re.sub(r"(?i)([.!?]\s+)wish\s+so\b", r"\1I wish so", msg)
-    msg = re.sub(r"(?i)([.!?]\s+)see\s+my\s+future\b", r"\1I see my future", msg)
-    msg = re.sub(r"(?i)([.!?]\s+)promise\b", r"\1I promise", msg)
-
-    # Direct pronoun OCR inside questions.
-    msg = re.sub(r"(?i)\bcan\s+\|\s+(ask|tell)\b", r"can I \1", msg)
-    msg = re.sub(r"(?i)\bMary,\s+can\s+\|\s+(ask|tell)\b", r"Mary, can I \1", msg)
-
-    # OCR punctuation artifacts around ellipses.
-    msg = msg.replace(":_.", "...")
-    msg = msg.replace(":-", "...")
-    msg = msg.replace("_.", "...")
-    msg = msg.replace(":...", "...")
-    msg = msg.replace("way:.", "way...")
-    msg = re.sub(r"[_]{2,}", "...", msg)
-    msg = msg.replace("_", "")
-
-    # Normalize ellipsis artifacts.
-    msg = re.sub(r"\.\.\.\s*\.", "...", msg)
-    msg = re.sub(r"\.\.\.\s*,", "...,", msg)
-    msg = re.sub(r"\.\.\s+", "... ", msg)
-    msg = re.sub(r"\s*\.\.\.\s*", "... ", msg)
-
-    # Generic colon/semicolon cleanup inside normal prose.
-    label_like = r"(name|country|city|option|account|iban|reference|mtcn|phone|email|amount|details|receiver|sender|beneficiary|bank|address|code|number)"
-    has_structured_label = re.search(rf"\b{label_like}\s*:", msg, flags=re.IGNORECASE)
-
-    if not has_structured_label:
-        msg = re.sub(r"\b([A-Z][a-z]{1,24});\s+(?=(can|I|I've|I'm|you|we|it|that|this|will)\b)", r"\1, ", msg)
-        msg = re.sub(r";\s+(?=(of|not|and|but|I|I'm|you|we|it|that|this|the|they|there|will|just|thanks|take)\b)", ", ", msg, flags=re.IGNORECASE)
-        msg = re.sub(
-            r":\s+(?=(my|there|the|they|i|you|he|she|we|it|this|that|and|but|because|so|be|please|just)\b)",
-            ". ",
-            msg,
-            flags=re.IGNORECASE
-        )
-        msg = re.sub(r"(?i):\s*promise\b", ". I promise", msg)
-        msg = re.sub(r"\b([A-Z][a-z]{1,24}):\s+(?=I?\s*will\b)", r"\1. ", msg)
-        msg = re.sub(r"\b([A-Z][a-z]{1,24}):\s+(?=I?\s*promise\b)", r"\1. ", msg)
-
-    # Conservative reorder fixes for common OCR/LLM line-order problems.
-    msg = re.sub(r"(?i)\bhug\s+Wish I could you\b", "Wish I could hug you", msg)
-    msg = re.sub(r"(?i)\bYou're the best day part of my\b", "You're the best part of my day", msg)
-    msg = re.sub(r"(?i)\bday finally I can\b", "day I can finally", msg)
-    msg = re.sub(r"(?i)\bWe could have beautiful life\b", "We could have a beautiful life", msg)
-    msg = re.sub(r"(?i)\bOne day soon my love\s+One day soon\.*", "One day soon my love. One day soon...", msg)
-    msg = re.sub(r"(?i)\bOne day soon my love day One soon\.?\.*\b", "One day soon my love. One day soon...", msg)
-    msg = re.sub(r"(?i)\bday One soon\.?\.*\b", "One day soon...", msg)
-    msg = re.sub(r"(?i)\bAww that's so sweet\s+You just made my day\b", "Aww that's so sweet. You just made my day", msg)
-    msg = re.sub(r"(?i)\bAww that's so sweet day You just made my\b", "Aww that's so sweet. You just made my day", msg)
-    msg = re.sub(r"(?i)\bnot far away:\.\.\.", "not far away...", msg)
-    msg = re.sub(r"(?i)\bday you understand me\b", "day... you understand me", msg)
-    msg = re.sub(r"(?i)\bYou make me\s+I\s+look forward\s+to\s+our\s+day:\s*messages every\b", "You make me happy too. I look forward to our messages every day", msg)
-    msg = re.sub(r"(?i)\bYou make me happy too\s+I\s+look\b", "You make me happy too. I look", msg)
-
-    # Add punctuation between merged short chat sentences.
-    msg = re.sub(r"(?i)\bGood morning Mary\s+How\b", "Good morning Mary. How", msg)
-    msg = re.sub(r"(?i)\bGood night Mary\s+Sweet\b", "Good night Mary. Sweet", msg)
-    msg = re.sub(r"(?i)\bGood morning my love\s+Hope\b", "Good morning my love. Hope", msg)
-    msg = re.sub(r"(?i)\bbeautiful day\s*-\s*today\b", "beautiful day today", msg)
-    msg = re.sub(r"(?i)\bThank you\s+I hope\b", "Thank you. I hope", msg)
-    msg = re.sub(r"(?i)\bGood morning!\s+slept\b", "Good morning! I slept", msg)
-    msg = re.sub(r"(?i)\bslept well;\s*thanks\b", "slept well, thanks", msg)
-    msg = re.sub(r"(?i)\bThat would be nice\s+wish\b", "That would be nice. I wish", msg)
-    msg = re.sub(r"(?i)\bpeaceful day my love\s+Just\b", "peaceful day my love. Just", msg)
-    msg = re.sub(r"(?i)\bkind of you\s+I'm\b", "kind of you. I'm", msg)
-    msg = re.sub(r"(?i)\bThank you Michael\s+You too\b", "Thank you Michael. You too", msg)
-    msg = re.sub(r"(?i)\bYou too;\s*take care\b", "You too, take care", msg)
-    msg = re.sub(r"(?i)\bAlways, my love\s+Thinking\b", "Always, my love. Thinking", msg)
-    msg = re.sub(r"(?i)\b5 years ago\s+I have\b", "5 years ago. I have", msg)
-    msg = re.sub(r"(?i)\bloss too\s+It\b", "loss too. It", msg)
-    msg = re.sub(r"(?i)\bThank you Michael\s+That\b", "Thank you Michael. That", msg)
-    msg = re.sub(r"(?i)\bThank you\s+You are\b", "Thank you. You are", msg)
-    msg = re.sub(r"(?i)\bstrong woman:\s*I admire\b", "strong woman. I admire", msg)
-    msg = re.sub(r"(?i)\bhappy too\s+I look\b", "happy too. I look", msg)
-    msg = re.sub(r"(?i)\bsame Michael\s+Maybe\b", "same, Michael. Maybe", msg)
-    msg = re.sub(r"(?i)\bMe too my love\s+Good night\b", "Me too my love. Good night", msg)
-    msg = re.sub(r"(?i)\bMary\s+feel a deep connection\b", "Mary. I feel a deep connection", msg)
-    msg = re.sub(r"(?i)\banything\s+I\s+feel\b", "anything. I feel", msg)
-    msg = re.sub(r"(?i)\bMichael\s+I'm\b", "Michael. I'm", msg)
-    msg = re.sub(r"(?i)\bMary\s+More\b", "Mary. More", msg)
-    msg = re.sub(r"(?i)\bMichael\s+I\s+dream\b", "Michael. I dream", msg)
-    msg = re.sub(r"(?i)\bMichael\s+Sweet\b", "Michael. Sweet", msg)
-    msg = re.sub(r"(?i)\bdreams\s+talk\b", "dreams... talk", msg)
-    msg = re.sub(r"(?i)\bbefore sleep\b", "before I sleep", msg)
-
-    # Extra Messenger OCR/order cleanup from Facebook screenshots.
-    msg = re.sub(r"(?i)\bHellol\b", "Hello!", msg)
-    msg = re.sub(r"(?i)^doing today\?\s*How are you\??$", "How are you doing today?", msg)
-    msg = re.sub(r"(?i)\bdoing today\?\s*How are you\b", "How are you doing today", msg)
-    msg = re.sub(r"(?i)\bHello!\s+I'm good[,;]\s+thank you!\s+And you\?", "Hello! I'm good, thank you! And you?", msg)
-
-    # Remove accidental excessive terminal quotes caused by CSV/LLM escaping.
-    msg = re.sub(r'"{2,}$', '"', msg)
-    msg = msg.replace('"""', '"')
-
-    # Whitespace/punctuation cleanup.
-    msg = re.sub(r"\s+", " ", msg).strip()
-    msg = re.sub(r"\s+([,.;:!?])", r"\1", msg)
-    msg = re.sub(r"\.\.\.\s*\.", "...", msg)
-    msg = re.sub(r"\s+\.\.\.", "...", msg)
-    msg = re.sub(r"\.{4,}", "...", msg)
-
-    if msg.endswith(":") and not re.search(rf"\b{label_like}\s*:$", msg, flags=re.IGNORECASE):
-        word_count = len(re.findall(r"\b\w+\b", msg))
-        if word_count >= 4:
-            msg = msg[:-1] + "."
-
-    return msg
-
-
-
-
-
-
-
-
+    """Apply minimal, generic cleanup without semantic rewriting."""
+    return conservative_clean_message_text(message)
 
 def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
     """Groups OCR blocks into timestamped bubble hints."""
@@ -1461,6 +1129,7 @@ def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
                     "side": side,
                     "confidence": f"{confidence:.3f}",
                     "text": group_text,
+                    "order": len(groups),
                 })
 
             current = []
@@ -1470,7 +1139,6 @@ def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
             current.append(row)
 
     return groups
-
 
 def infer_side_for_message_from_ocr(
     message: str,
@@ -1514,22 +1182,14 @@ def infer_side_for_message_from_ocr(
 
     return best_side if best_side in {"LEFT", "RIGHT"} else None
 
-
-
 def normalize_for_fragment_check(text: str) -> str:
     """Normalizes Messenger text for fragment and duplicate checks."""
     text = str(text or "").lower()
 
     # Normalize common OCR spelling variants before duplicate/overlap checks.
-    text = re.sub(r"\bhellol\b", "hello", text)
-    text = re.sub(r"\bmichaell\b", "michael", text)
-    text = re.sub(r"\blovel\b", "love", text)
-    text = re.sub(r"\btool\b", "too", text)
     text = text.replace("’", "'")
-
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
-
 
 def token_overlap_score(a: str, b: str) -> float:
     """Scores token overlap while preserving duplicate-token counts."""
@@ -1557,7 +1217,6 @@ def token_overlap_score(a: str, b: str) -> float:
             b_counts[tok] -= 1
 
     return overlap / max(1, min(len(a_tokens), len(b_tokens)))
-
 
 def infer_side_from_messenger_bubbles(
     message: str,
@@ -1595,7 +1254,6 @@ def infer_side_from_messenger_bubbles(
 
     return None
 
-
 def split_message_by_messenger_bubbles(
     message: str,
     side: str,
@@ -1629,10 +1287,6 @@ def split_message_by_messenger_bubbles(
         if len(g_words) < 3:
             continue
 
-        # Avoid using very noisy reversed question fragments as split anchors.
-        if re.search(r"(?i)doing today\?\s*how are you", g_text):
-            continue
-
         pos = msg_norm.find(g_norm)
         if pos >= 0 and pos > last_pos:
             matches.append(g_text)
@@ -1648,8 +1302,6 @@ def split_message_by_messenger_bubbles(
 
     return [message]
 
-
-
 def is_short_contained_duplicate(
     message: str,
     time_value: str,
@@ -1657,11 +1309,7 @@ def is_short_contained_duplicate(
     emitted_rows: List[Tuple[str, str, str]]
 ) -> bool:
     """Detects short duplicate fragments already contained in earlier rows."""
-    # Notes:
-    # Example:
-    # previous row: "Mary, can I tell you something?"
-    # current row:  "something?"
-    # -> remove current row
+
     msg_norm = normalize_for_fragment_check(message)
     word_count = len(msg_norm.split())
 
@@ -1682,7 +1330,157 @@ def is_short_contained_duplicate(
 
     return False
 
+def should_prefer_messenger_bubble_text(message: str, bubble_text: str) -> bool:
+    """Decide whether an OCR bubble hint is safer than a suspicious draft row.
 
+    This is deliberately narrow: the bubble hint is used as final text only when
+    the draft row is structurally suspicious but both strings clearly describe
+    the same visible bubble. This avoids general semantic rewriting.
+    """
+    msg = str(message or "").strip()
+    bubble = str(bubble_text or "").strip()
+    if not msg or not bubble:
+        return False
+
+    msg_norm = normalize_for_fragment_check(msg)
+    bubble_norm = normalize_for_fragment_check(bubble)
+    msg_words = msg_norm.split()
+    bubble_words = bubble_norm.split()
+    if len(msg_words) < 3 or len(bubble_words) < 3:
+        return False
+
+    overlap = token_overlap_score(msg, bubble)
+    if overlap < 0.86:
+        return False
+
+    # Use bubble text only for rows that already look broken: lowercase orphan
+    # questions/fragments, missing initial-I artifacts, or obvious OCR punctuation.
+    suspicious = (
+        looks_like_orphan_fragment_message(msg)
+        or bool(re.search(r"\b(?:I{2}l|1['’]?ll|Ijust|Iwill|Icant|yoU|sO)\b", msg))
+    )
+    if not suspicious:
+        return False
+
+    # Do not inject visibly noisy OCR.
+    if re.search(r"(?<![A-Za-z0-9])\d{1,2}[:.,;]\d{2}(?![A-Za-z0-9])", bubble):
+        return False
+    if re.search(r"[|_=]", bubble):
+        return False
+
+    # Prefer bubble text when it has a more plausible sentence start or more
+    # complete wording, but not just because it is longer.
+    msg_starts_lower = bool(msg[:1].islower())
+    bubble_starts_upper = bool(bubble[:1].isupper())
+    if msg_starts_lower and bubble_starts_upper:
+        return True
+
+    if len(bubble_words) >= len(msg_words) + 1 and not bubble_starts_upper:
+        return False
+
+    # Same token set but different word order: choose the bubble if it has
+    # normal question/sentence punctuation and the draft starts as a fragment.
+    if sorted(msg_words) == sorted(bubble_words) and msg_starts_lower:
+        return True
+
+    return False
+
+def repair_message_from_messenger_bubbles(
+    message: str,
+    side: str,
+    messenger_bubble_groups: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Repair suspicious Facebook rows using the matching visible bubble hint."""
+    if not messenger_bubble_groups:
+        return message
+
+    best_group_text = ""
+    best_score = 0.0
+    for group in messenger_bubble_groups:
+        group_side = str(group.get("side", "")).upper()
+        if side in {"LEFT", "RIGHT"} and group_side in {"LEFT", "RIGHT"} and group_side != side:
+            continue
+        text = str(group.get("text", "")).strip()
+        score = token_overlap_score(message, text)
+        if score > best_score:
+            best_score = score
+            best_group_text = text
+
+    if best_score >= 0.86 and should_prefer_messenger_bubble_text(message, best_group_text):
+        return best_group_text
+
+    return message
+
+def messenger_bubble_order_for_message(
+    message: str,
+    side: str,
+    messenger_bubble_groups: Optional[List[Dict[str, str]]] = None,
+) -> Optional[int]:
+    """Find the best matching visible Messenger bubble order for a row."""
+    if not messenger_bubble_groups:
+        return None
+
+    best_order: Optional[int] = None
+    best_score = 0.0
+    for i, group in enumerate(messenger_bubble_groups):
+        group_side = str(group.get("side", "")).upper()
+        if side in {"LEFT", "RIGHT"} and group_side in {"LEFT", "RIGHT"} and group_side != side:
+            # Try same-side matches first; wrong-side duplicate rows are handled by side correction before this.
+            continue
+        score = token_overlap_score(message, str(group.get("text", "")))
+        if score > best_score:
+            best_score = score
+            try:
+                best_order = int(group.get("order", i))
+            except Exception:
+                best_order = i
+
+    if best_score >= 0.48:
+        return best_order
+    return None
+
+def reorder_side_csv_by_messenger_order(
+    side_csv: str,
+    messenger_bubble_groups: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Reorder rows to match visual bubble order when OCR geometry can support it."""
+    if not messenger_bubble_groups:
+        return side_csv
+
+    rows: List[Tuple[int, Optional[int], List[str]]] = []
+    reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
+    original_index = 0
+    for row in reader:
+        if not row:
+            continue
+        if len(row) >= 3 and row[0].strip().lower() == "time":
+            continue
+        if len(row) < 3:
+            continue
+        time_value = row[0].strip()
+        side = row[1].strip().upper()
+        message = ",".join(row[2:]).strip() if len(row) > 3 else row[2].strip()
+        order = messenger_bubble_order_for_message(message, side, messenger_bubble_groups)
+        rows.append((original_index, order, [time_value, side, message]))
+        original_index += 1
+
+    # When a row can be matched to a visible bubble, sort by bubble order.
+    # Unmatched rows stay in their original relative position after matched rows near them.
+    rows.sort(key=lambda item: (item[1] is None, item[1] if item[1] is not None else item[0], item[0]))
+
+    out = io.StringIO()
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerow(["Time", "Side", "Message"])
+
+    seen = set()
+    for _, _, row in rows:
+        item = tuple(row)
+        if item in seen:
+            continue
+        seen.add(item)
+        writer.writerow(row)
+
+    return out.getvalue().strip() + "\n"
 
 # Cleans the LLM CSV, validates times/sides, and removes UI noise.
 def normalize_side_csv(
@@ -1730,10 +1528,8 @@ def normalize_side_csv(
         hhmm = extract_hhmm_from_full_time(time_value)
 
         # Facebook Messenger often shows only a central date/time separator.
-        # Treat OCR-visible times as anchors, not as a strict whitelist.
-        # This allows inferred per-bubble times such as 10:33, 10:36, etc.
-        # Without this, all inferred times are discarded and many rows keep
-        # the same screen-level timestamp.
+        # Accept valid full timestamps, but final postprocessing does not spread
+        # repeated screen-level times into fabricated per-message minute offsets.
         if not re.fullmatch(r"\d{2}/\d{2}/\d{4}\s+\d{2}:\d{2}", time_value):
             continue
 
@@ -1752,6 +1548,12 @@ def normalize_side_csv(
         if messenger_side in {"LEFT", "RIGHT"}:
             side = messenger_side
 
+        message = repair_message_from_messenger_bubbles(
+            message=message,
+            side=side,
+            messenger_bubble_groups=messenger_bubble_groups,
+        )
+
         candidate_messages = split_message_by_messenger_bubbles(
             message=message,
             side=side,
@@ -1759,6 +1561,11 @@ def normalize_side_csv(
         )
 
         for candidate_message in candidate_messages:
+            candidate_message = repair_message_from_messenger_bubbles(
+                message=candidate_message,
+                side=side,
+                messenger_bubble_groups=messenger_bubble_groups,
+            )
             cleaned_message = clean_message_text(candidate_message)
             if emoji_mode == "omit":
                 cleaned_message = strip_emojis(cleaned_message)
@@ -1782,8 +1589,18 @@ def normalize_side_csv(
             emitted_rows.append(item)
             writer.writerow(item)
 
-    return out.getvalue().strip() + "\n"
+    add_missing_messenger_bubbles_to_rows(
+        emitted_rows=emitted_rows,
+        seen=seen,
+        writer=writer,
+        visible_date=visible_date,
+        allowed_times=allowed_times,
+        emoji_mode=emoji_mode,
+        messenger_bubble_groups=messenger_bubble_groups,
+    )
 
+    normalized = out.getvalue().strip() + "\n"
+    return reorder_side_csv_by_messenger_order(normalized, messenger_bubble_groups)
 
 def add_missing_messenger_bubbles_to_rows(
     emitted_rows: List[Tuple[str, str, str]],
@@ -1853,12 +1670,6 @@ def add_missing_messenger_bubbles_to_rows(
         emitted_rows.append(item)
         writer.writerow(item)
 
-
-
-
-
-
-
 def parse_side_csv_datetime(time_value: str):
     """Parses supported side-CSV timestamp formats."""
     from datetime import datetime
@@ -1871,11 +1682,9 @@ def parse_side_csv_datetime(time_value: str):
             pass
     return None
 
-
 def format_side_csv_datetime(dt) -> str:
     """Formats a datetime for the final CSV timestamp style."""
     return dt.strftime("%d/%m/%Y %H:%M")
-
 
 def estimate_messenger_gap_minutes(prev_side: str, side: str, prev_message: str, message: str) -> int:
     """Estimates a small gap between consecutive Messenger bubbles."""
@@ -1897,7 +1706,6 @@ def estimate_messenger_gap_minutes(prev_side: str, side: str, prev_message: str,
         gap += 1
 
     return max(1, min(gap, 5))
-
 
 def spread_repeated_messenger_times(side_csv: str) -> str:
     """Spreads repeated Messenger screen-level timestamps forward."""
@@ -1973,7 +1781,6 @@ def spread_repeated_messenger_times(side_csv: str) -> str:
 
     return out.getvalue().strip() + "\n"
 
-
 def looks_like_fragment_message(message: str) -> bool:
     """Detects small OCR fragments that should merge into the previous row."""
     # Notes:
@@ -1985,324 +1792,22 @@ def looks_like_fragment_message(message: str) -> bool:
     words = msg.split()
     lower = msg.lower().strip(" .,:;!?")
 
-    if lower in {"ahead", "with you", "soon", "too"}:
-        return True
-
     if len(words) <= 2 and msg[:1].islower():
         return True
 
     return False
 
-
 def postprocess_facebook_side_rows(side_csv: str) -> str:
-    """Applies final Messenger-specific row cleanup before name mapping."""
-    # Notes:
-    # Fixes common VLM/OCR artifacts:
-    # - split fragments such as "... long day" + "ahead"
-    # - merged two-message rows that are common in Messenger screenshots
-    # - a small number of high-confidence Messenger OCR/text artifacts
-    def repair_common_message_text(msg: str) -> str:
-        """Repairs common Messenger OCR and ordering artifacts."""
-        msg = str(msg or "").strip()
+    """Deprecated compatibility wrapper for older call sites.
 
-        replacements = {
-            "Of course YOU Can tell me anything I I feel the same with you.": "Of course you can tell me anything. I feel the same with you.",
-            "Of course YOU Can tell me anything I I feel the same with you": "Of course you can tell me anything. I feel the same with you.",
-            "will Mary, I always think about you and that keeps me strong.": "I will Mary, I always think about you and that keeps me strong.",
-            "will Mary, I always think about you and that keeps me strong": "I will Mary, I always think about you and that keeps me strong.",
-            "Wish I could you right now...": "Wish I could hug you right now...",
-            "believe you Michael. I'm waiting for day that too.": "I believe you Michael. I'm waiting for that day too.",
-            "believe you Michael. I'm waiting for day that too": "I believe you Michael. I'm waiting for that day too.",
-            "I can't wait for day Ihold the your hand in Greece": "I can't wait for the day I hold your hand in Greece",
-            "You are the last thought in mind my every night before I sleep.": "You are the last thought in my mind every night before I sleep.",
-            "You are the last thought in mind my every night before I sleep": "You are the last thought in my mind every night before I sleep.",
-            "Sure; here is number: my 6949999999": "Sure, here is my number: 6949999999",
-            "Sure, here is number: my 6949999999": "Sure, here is my number: 6949999999",
-        }
-
-        if msg in replacements:
-            return replacements[msg]
-
-        msg = msg.replace(" =", "").strip()
-        msg = msg.replace("I I feel", "I feel")
-        msg = msg.replace("YOU Can", "you can")
-        msg = msg.replace("You tool", "You too")
-        msg = msg.replace("Ihold", "I hold")
-        msg = msg.replace("Tm ", "I'm ")
-        msg = msg.replace("Im ", "I'm ")
-        msg = msg.replace("|'Il", "I'll")
-        msg = msg.replace("|'ll", "I'll")
-
-        return msg.strip()
-
-    def normalized(msg: str) -> str:
-        """Normalizes text for exact cleanup-rule comparisons."""
-        return " ".join(str(msg or "").lower().strip().split())
-
-    def split_known_merged_message(time_value: str, side: str, msg: str):
-        """Splits known merged Messenger messages into separate rows."""
-        low = normalized(msg)
-
-        if low == "good morning mary. how did you sleep?":
-            return [
-                [time_value, side, "Good morning Mary"],
-                [increment_time_minutes(time_value, 1), side, "How did you sleep?"],
-            ]
-
-        if low in {
-            "good morning my love. hope you have a beautiful day today",
-            "good morning my love. i hope you have a beautiful day today",
-        }:
-            return [
-                [time_value, side, "Good morning my love"],
-                [increment_time_minutes(time_value, 1), side, "Hope you have a beautiful day today"],
-            ]
-
-        if low == "one day soon my love one day":
-            return [
-                [time_value, side, "One day soon my love"],
-                [increment_time_minutes(time_value, 1), side, "One day soon..."],
-            ]
-
-        if low == "hope you're having a peaceful day my love. just checking in to see how you're doing":
-            return [
-                [time_value, side, "Hope you're having a peaceful day my love"],
-                [increment_time_minutes(time_value, 1), side, "Just checking in to see how you're doing."],
-            ]
-
-        if low == "i lost my wife too, 4 years ago. we didn't have children.":
-            return [
-                [time_value, side, "I lost my wife too, 4 years ago."],
-                [increment_time_minutes(time_value, 1), side, "We didn't have children."],
-            ]
-
-        if low == "you are such a strong woman. i admire the way you handle life.":
-            return [
-                [time_value, side, "You are such a strong woman."],
-                [increment_time_minutes(time_value, 1), side, "I admire the way you handle life."],
-            ]
-
-        if low == "i feel our connection is something very special. i'm glad the universe brought us together.":
-            return [
-                [time_value, side, "I feel our connection is something very special."],
-                [increment_time_minutes(time_value, 1), side, "I'm glad the universe brought us together."],
-            ]
-
-        if low.startswith("no, i'm a widow.") and "i have one son" in low and "i feel a little lonely" in low:
-            return [
-                [time_value, side, "No, I'm a widow. My husband passed away 5 years ago."],
-                [increment_time_minutes(time_value, 1), side, "I have one son. He's 24 and lives in Thessaloniki."],
-                [increment_time_minutes(time_value, 2), side, "I feel a little lonely sometimes..."],
-            ]
-
-        return [[time_value, side, msg]]
-
-    rows = []
-
-    reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
-    for row in reader:
-        if not row:
-            continue
-
-        if len(row) >= 3 and row[0].strip().lower() == "time":
-            continue
-
-        if len(row) != 3:
-            continue
-
-        time_value = row[0].strip()
-        side = row[1].strip().upper()
-        message = repair_common_message_text(clean_message_text(row[2].strip()))
-
-        if side in {"LEFT", "RIGHT"} and time_value and message:
-            rows.append([time_value, side, message])
-
-    cleaned = []
-
-    for idx, (time_value, side, message) in enumerate(rows):
-        msg = repair_common_message_text(message)
-        low = normalized(msg)
-
-        # Recover a high-confidence missing first-screen bubble seen in OCR as
-        # "doing today? How are you".
-        if low == "hello mary":
-            cleaned.append([time_value, side, msg])
-            already_has_question = any(
-                "how are you doing today" in normalized(r[2])
-                for r in rows[max(0, idx - 1):idx + 4]
-            )
-            if not already_has_question:
-                cleaned.append([increment_time_minutes(time_value, 1), side, "How are you doing today?"])
-            continue
-
-        # Merge a fragment that the model sometimes assigns to the wrong side.
-        if cleaned and low in {"with you:", "with you"} and "i feel the same" in normalized(cleaned[-1][2]):
-            cleaned[-1][2] = cleaned[-1][2].rstrip(" .:") + " with you."
-            continue
-
-        # If this row is only a tiny continuation fragment, merge into previous
-        # row if the side is the same.
-        if cleaned and looks_like_fragment_message(msg) and cleaned[-1][1] == side:
-            prev = cleaned[-1][2].rstrip(" .")
-            frag = msg.strip(" .")
-            cleaned[-1][2] = f"{prev} {frag}".strip()
-            continue
-
-        for split_row in split_known_merged_message(time_value, side, msg):
-            cleaned.append(split_row)
-
-    out = io.StringIO()
-    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
-    writer.writerow(["Time", "Side", "Message"])
-
-    seen = set()
-    for row in cleaned:
-        item = tuple(row)
-        if item in seen:
-            continue
-        seen.add(item)
-        writer.writerow(row)
-
-    return out.getvalue().strip() + "\n"
-
-
-def increment_time_minutes(time_value: str, minutes: int) -> str:
-    """Adds minutes to a CSV timestamp when parsing succeeds."""
-    from datetime import timedelta
-
-    dt = parse_side_csv_datetime(time_value)
-    if dt is None:
-        return time_value
-
-    return format_side_csv_datetime(dt + timedelta(minutes=minutes))
-
+    Final cleanup is intentionally generic and lives in extractor_utils.py.
+    It should not contain dataset-specific phrase rewrites.
+    """
+    return postprocess_side_csv_rows(side_csv)
 
 def postprocess_facebook_side_rows_patch4(side_csv: str) -> str:
-    """Applies conservative sequence-level Messenger cleanup rules."""
-    # Notes:
-    # This targets remaining observed Messenger artifacts:
-    # - missing greeting at the start of a reply
-    # - two adjacent Mary good-night bubbles that should be one row
-    # - fragmented "continue communication on Viber" message
-    # - obvious reply bubble assigned to the wrong side
-    def n(msg: str) -> str:
-        """Normalizes message text for compact sequence-rule comparisons."""
-        return " ".join(str(msg or "").lower().strip().split())
-
-    rows = []
-    reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
-
-    for row in reader:
-        if not row:
-            continue
-        if len(row) >= 3 and row[0].strip().lower() == "time":
-            continue
-        if len(row) != 3:
-            continue
-
-        time_value = row[0].strip()
-        side = row[1].strip().upper()
-        message = clean_message_text(row[2].strip())
-
-        if side in {"LEFT", "RIGHT"} and time_value and message:
-            rows.append([time_value, side, message])
-
-    fixed = []
-    i = 0
-
-    while i < len(rows):
-        time_value, side, message = rows[i]
-        low = n(message)
-
-        # Add missing greeting in Mary's reply.
-        if side == "RIGHT" and low == "i slept well, thanks!":
-            fixed.append([time_value, side, "Good morning! I slept well, thanks!"])
-            i += 1
-            continue
-
-        # Merge Mary good-night split:
-        # "Good night Michael" + "Sweet dreams. talk to you tomorrow."
-        if (
-            i + 1 < len(rows)
-            and side == "RIGHT"
-            and n(message) == "good night michael"
-            and rows[i + 1][1] == "RIGHT"
-            and "sweet dreams" in n(rows[i + 1][2])
-            and "talk to you tomorrow" in n(rows[i + 1][2])
-        ):
-            fixed.append([
-                time_value,
-                side,
-                "Good night Michael. Sweet dreams... talk to you tomorrow."
-            ])
-            i += 2
-            continue
-
-        # Merge fragmented Viber transition message.
-        if (
-            i + 2 < len(rows)
-            and side == "LEFT"
-            and n(message) in {"thinking it would be was", "i was thinking it would be was"}
-            and rows[i + 1][1] == "LEFT"
-            and n(rows[i + 1][2]) == "better if we continue our"
-            and rows[i + 2][1] == "LEFT"
-            and n(rows[i + 2][2]).rstrip(".") == "communication on viber"
-        ):
-            # If previous row is same burst, using previous timestamp is often closer
-            # to Messenger's hidden-message grouping than the interpolated fragment time.
-            merged_time = time_value
-            if fixed and fixed[-1][1] == "LEFT" and fixed[-1][0][:10] == time_value[:10]:
-                merged_time = fixed[-1][0]
-
-            fixed.append([
-                merged_time,
-                "LEFT",
-                "I was thinking it would be better if we continue our communication on Viber."
-            ])
-            i += 3
-            continue
-
-        # Obvious Mary reply assigned to LEFT: contains "You too!".
-        if (
-            side == "LEFT"
-            and "good morning my love" in low
-            and "you too" in low
-            and "safe week" in low
-        ):
-            # Keep date, set a plausible reply time 5 minutes after the visible anchor
-            # when the current time is the screen's anchor-derived 08:40.
-            new_time = time_value
-            if time_value.endswith("08:40"):
-                new_time = time_value[:11] + "08:45"
-
-            fixed.append([
-                new_time,
-                "RIGHT",
-                "Good morning my love! You too! I hope you have a safe week."
-            ])
-            i += 1
-            continue
-
-        fixed.append([time_value, side, message])
-        i += 1
-
-    out = io.StringIO()
-    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
-    writer.writerow(["Time", "Side", "Message"])
-
-    seen = set()
-    for row in fixed:
-        item = tuple(row)
-        if item in seen:
-            continue
-        seen.add(item)
-        writer.writerow(row)
-
-    return out.getvalue().strip() + "\n"
-
-
-# Converts LEFT/RIGHT rows into Sender/Receiver rows.
-
+    """Deprecated compatibility wrapper for older call sites."""
+    return postprocess_side_csv_rows(side_csv)
 
 def extract_last_date_from_side_csv(side_csv: str) -> str:
     """Returns the last DD/MM/YYYY date seen in a side CSV."""
@@ -2316,14 +1821,9 @@ def extract_last_date_from_side_csv(side_csv: str) -> str:
                 last_date = m.group(1)
     return last_date
 
-
 # ============================================================
 # PIPELINE
 # ============================================================
-
-
-
-
 
 def process_facebook_image(
     image_path: str,
@@ -2496,49 +1996,62 @@ def process_facebook_image(
             messenger_bubble_groups=messenger_bubble_groups,
         )
 
-        print(f"-> [LLM] Repairing screen #{idx} Side CSV...")
-
-        repair_prompt = build_screen_repair_prompt(
-            draft_csv=draft_norm,
-            screen_ocr=screen_ocr,
-            screen_index=idx,
-            visible_date=visible_date,
-            default_year=default_year,
-            allowed_times=allowed_times,
-            emoji_mode=emoji_mode,
-            bubble_hints=bubble_hints,
+        expected_bubbles = len(messenger_bubble_groups) if messenger_bubble_groups else 0
+        repair_needed = side_csv_needs_repair(
+            draft_norm,
+            expected_bubble_count=expected_bubbles,
         )
 
-        # Repair pass catches missing bubbles and bad splits/merges.
-        repaired = ollama_chat_screen(
-            model,
-            repair_prompt,
-            crop_path,
-            use_vision=use_vision,
-        )
+        if repair_needed:
+            print(f"-> [LLM] Repairing suspicious screen #{idx} Side CSV...")
 
-        if dump_draft:
-            (output_debug_dir / f"screen_{idx:02d}_repair_raw.csv").write_text(
-                repaired,
-                encoding="utf-8",
+            repair_prompt = build_screen_repair_prompt(
+                draft_csv=draft_norm,
+                screen_ocr=screen_ocr,
+                screen_index=idx,
+                visible_date=visible_date,
+                default_year=default_year,
+                allowed_times=allowed_times,
+                emoji_mode=emoji_mode,
+                bubble_hints=bubble_hints,
             )
 
-        repaired_norm = normalize_side_csv(
-            repaired,
-            visible_date=visible_date,
-            default_year=default_year,
-            allowed_times=allowed_times,
-            emoji_mode=emoji_mode,
-            ocr_bubble_groups=ocr_bubble_groups,
-            messenger_bubble_groups=messenger_bubble_groups,
-        )
+            # Repair pass is now run only for suspicious screens/rows.
+            repaired = ollama_chat_screen(
+                model,
+                repair_prompt,
+                crop_path,
+                use_vision=use_vision,
+            )
+
+            if dump_draft:
+                (output_debug_dir / f"screen_{idx:02d}_repair_raw.csv").write_text(
+                    repaired,
+                    encoding="utf-8",
+                )
+
+            repaired_norm = normalize_side_csv(
+                repaired,
+                visible_date=visible_date,
+                default_year=default_year,
+                allowed_times=allowed_times,
+                emoji_mode=emoji_mode,
+                ocr_bubble_groups=ocr_bubble_groups,
+                messenger_bubble_groups=messenger_bubble_groups,
+            )
+        else:
+            print(f"-> [LLM] Screen #{idx} looks stable; skipping repair pass.")
+            repaired_norm = ""
 
         # Keep the repaired CSV only if it stays within a sane row count.
-        chosen = choose_best_screen_side_csv(
-            draft_norm=draft_norm,
-            repaired_norm=repaired_norm,
-            allowed_times=allowed_times,
-        )
+        if repaired_norm:
+            chosen = choose_best_screen_side_csv(
+                draft_norm=draft_norm,
+                repaired_norm=repaired_norm,
+                allowed_times=allowed_times,
+            )
+        else:
+            chosen = draft_norm
 
         if dump_draft:
             (output_debug_dir / f"screen_{idx:02d}_side.csv").write_text(
@@ -2555,15 +2068,12 @@ def process_facebook_image(
     # Merge all screen-level CSV parts before applying real names.
     raw_merged_side_csv = merge_side_csvs(side_csv_parts)
 
-    # Messenger screenshots often repeat one screen-level timestamp for many bubbles.
-    # Spread repeated timestamps before mapping LEFT/RIGHT to real names.
-    merged_side_csv = spread_repeated_messenger_times(raw_merged_side_csv)
+    # Keep Facebook Messenger timestamps as visible/screen-level anchors.
+    # Do not spread/fabricate per-message minute offsets.
+    merged_side_csv = raw_merged_side_csv
 
-    # Final Facebook-specific cleanup for split/merged Messenger bubbles.
-    merged_side_csv = postprocess_facebook_side_rows(merged_side_csv)
-
-    # Extra conservative cleanup for remaining sequence-level Messenger artifacts.
-    merged_side_csv = postprocess_facebook_side_rows_patch4(merged_side_csv)
+    # Generic cleanup only: adjacent near-duplicates and safe continuation fragments.
+    merged_side_csv = postprocess_side_csv_rows(merged_side_csv)
 
     if dump_draft:
         (output_debug_dir / "merged_side_raw.csv").write_text(
@@ -2582,7 +2092,6 @@ def process_facebook_image(
     )
 
     return final_csv
-
 
 # ============================================================
 # MAIN
@@ -2659,9 +2168,15 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Keep debug crops/OCR/intermediate files. Default: off.",
+    )
+
+    parser.add_argument(
         "--debug-dir",
         default=None,
-        help="Directory for crops/OCR/debug files",
+        help="Directory for crops/OCR/debug files. Implies --debug.",
     )
 
     # Standard double-dash flags.
@@ -2715,12 +2230,22 @@ if __name__ == "__main__":
     script_dir = Path(__file__).resolve().parent
     image_base = image_path.stem
 
-    debug_dir = Path(args.debug_dir) if args.debug_dir else script_dir / f"{image_base}_debug"
+    debug_requested = bool(args.debug or args.debug_dir or args.dump_ocr or args.dump_draft or args.dump_side_map)
+    debug_temp = None
+    if args.debug_dir:
+        debug_dir = Path(args.debug_dir)
+    elif debug_requested:
+        debug_dir = script_dir / f"{image_base}_debug"
+    else:
+        debug_temp = tempfile.TemporaryDirectory(prefix=f"{image_base}_extract_")
+        debug_dir = Path(debug_temp.name)
+
     output_path = Path(args.output) if args.output else script_dir / f"{image_base}_extracted.csv"
 
     langs = [x.strip() for x in args.langs.split(",") if x.strip()]
 
-    final_csv = process_facebook_image(
+    try:
+        final_csv = process_facebook_image(
         image_path=str(image_path),
         report_text=report_text,
         model=args.model,
@@ -2735,6 +2260,9 @@ if __name__ == "__main__":
         dump_draft=args.dump_draft,
         dump_side_map=args.dump_side_map,
     )
+    finally:
+        if debug_temp is not None:
+            debug_temp.cleanup()
 
     output_path.write_text(final_csv, encoding="utf-8-sig")
 
@@ -2742,4 +2270,5 @@ if __name__ == "__main__":
     print(final_csv)
 
     print(f"\n[SUCCESS] CSV saved to: {output_path}")
-    print(f"[DEBUG] Debug folder: {debug_dir}")
+    if debug_requested:
+        print(f"[DEBUG] Debug folder: {debug_dir}")

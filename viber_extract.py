@@ -1,14 +1,12 @@
 """Viber screenshot-to-CSV extractor."""
 
-# Short summary:
-# This script extracts chat messages from screenshot images/collages into CSV.
-# It uses OCR for text/position hints and Ollama/VLM calls for final reconstruction.
 import sys
 import re
 import csv
 import io
 import json
 import argparse
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set
 
@@ -18,12 +16,9 @@ import easyocr
 import ollama
 from PyPDF2 import PdfReader
 
-
-# Common geometry aliases used by OCR and crop splitting helpers.
 Box = Tuple[int, int, int, int]
 ScreenCrop = Tuple[int, int, int, int, np.ndarray]
 
-# Shared helpers keep duplicated Facebook/Viber logic in one module.
 from extractor_utils import (
     extract_text_from_report,
     extract_year_from_report,
@@ -69,46 +64,15 @@ from extractor_utils import (
     apply_side_mapping,
     write_crop,
     choose_best_screen_side_csv,
+    conservative_clean_message_text,
+    postprocess_side_csv_rows,
+    side_csv_needs_repair,
+    looks_like_noisy_ocr_text,
 )
-
-
-
-# ============================================================
-# FILE / REPORT READING
-# ============================================================
-
-
-
-
 
 # ============================================================
 # IMAGE / COLLAGE SPLITTING
 # ============================================================
-
-# Parses manual grid layouts such as 2x1 or 3x2.
-
-
-# Parses uneven collage row layouts such as 2,3.
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # Main crop splitter: manual options first, then automatic fallbacks.
 def get_screen_crops(
     image_path: str,
@@ -136,23 +100,9 @@ def get_screen_crops(
 
     return contour_fallback_split(image)
 
-
 # ============================================================
 # OCR WITH POSITIONED BLOCKS
 # ============================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
 def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
     """Classifies an OCR box as LEFT, RIGHT, or CENTER by geometry."""
     x, y, bw, bh = bbox
@@ -167,8 +117,6 @@ def position_tag_from_bbox(bbox: Box, crop_w: int, text: str) -> str:
         return "RIGHT"
 
     return "LEFT"
-
-
 
 def estimate_side_from_bubble_color(image: np.ndarray, bbox: Box) -> Optional[str]:
     """Detects Viber outgoing bubbles using local purple color evidence."""
@@ -216,7 +164,6 @@ def estimate_side_from_bubble_color(image: np.ndarray, bbox: Box) -> Optional[st
 
     return None
 
-
 def position_tag_from_color_or_bbox(
     image: np.ndarray,
     bbox: Box,
@@ -232,7 +179,6 @@ def position_tag_from_color_or_bbox(
         return color_side
 
     return position_tag_from_bbox(bbox, crop_w, text)
-
 
 def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
     """Corrects OCR side labels for fragments on the same visual line."""
@@ -288,7 +234,7 @@ def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
         min_x = min(b["x"] for b in line)
 
         # If a visual line starts on the left, the whole line belongs to a LEFT bubble.
-        # A real RIGHT purple bubble should not have any text starting this far left.
+        # A real right-side bubble should not have any text starting this far left.
         if min_x < crop_w * 0.22:
             for b in line:
                 b["pos"] = "LEFT"
@@ -297,7 +243,6 @@ def refine_ocr_block_positions(blocks: List[Dict], crop_w: int) -> List[Dict]:
                 b["pos"] = "RIGHT"
 
     return blocks
-
 
 # Runs EasyOCR and keeps each text block with side/position metadata.
 def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
@@ -370,17 +315,9 @@ def extract_ocr_blocks(reader, crop: np.ndarray, screen_index: int) -> str:
 
     return "\n".join(lines)
 
-
 # ============================================================
 # OCR PARSING / SCREEN TIME LIMITS
 # ============================================================
-
-
-
-
-
-
-
 def extract_visible_date_from_ocr(
     screen_ocr: str,
     default_year: int,
@@ -414,40 +351,9 @@ def extract_visible_date_from_ocr(
 
     return ""
 
-
-# ============================================================
-# LLM HELPERS
-# ============================================================
-
-
-
-
-
-
-
-
-
 # ============================================================
 # REPORT ACTORS + SIDE MAP
 # ============================================================
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 def find_header_match(ocr_data: str, actors: Dict) -> str:
     """Matches top header OCR against known report actors."""
     # Notes:
@@ -504,10 +410,6 @@ def find_header_match(ocr_data: str, actors: Dict) -> str:
         return ""
 
     return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)[0][0]
-
-
-
-
 
 def deterministic_viber_side_map(
     actors: Dict,
@@ -597,8 +499,6 @@ def deterministic_viber_side_map(
 
     return None
 
-
-
 def build_side_map_prompt(
     report_text: str,
     actors: Dict,
@@ -632,7 +532,6 @@ Rules:
 5. If the header/contact is a suspect and the victim is the screenshot owner, map LEFT=suspect and RIGHT=victim.
 6. Do not output explanations.
 """
-
 
 # Builds the final LEFT/RIGHT speaker mapping before CSV conversion.
 def infer_side_mapping(
@@ -673,11 +572,9 @@ def infer_side_mapping(
         "RIGHT": right,
     }
 
-
 # ============================================================
 # SCREEN EXTRACTION PROMPTS
 # ============================================================
-
 def build_screen_prompt(
     screen_ocr: str,
     screen_index: int,
@@ -696,7 +593,7 @@ def build_screen_prompt(
 
     return f"""
 You are extracting messages from ONE Viber screenshot image.
-Use the attached image as the primary source. Use OCR blocks only as support.
+Use the attached image as the primary source. Use OCR blocks only as support for time, side, and bubble boundaries. OCR text can be noisy; do not copy OCR word-order artifacts when the image is clearer.
 
 SCREEN INDEX: {screen_index}
 VISIBLE DATE FOR THIS SCREEN: {visible_date or "unknown"}
@@ -718,24 +615,24 @@ Rules:
 3. Side must be LEFT or RIGHT based only on visible bubble position/color in the image.
 4. LEFT = dark/gray incoming bubble. RIGHT = purple outgoing bubble.
 5. Do not output participant names. Do not infer side from meaning.
-6. Reconstruct each visible rounded bubble as one row. Do not output one row per OCR line.
-7. Use VIBER BUBBLE HINTS as a guide: normally each [BUBBLE n] should become one CSV row with that TIME and SIDE, unless it is clearly UI noise.
-8. If two separate rounded bubbles show the same timestamp, still output two separate rows.
+6. Reconstruct each visible rounded bubble as one row. Do not output one row per OCR line. Do not merge different rounded bubbles.
+7. Use VIBER BUBBLE HINTS as a guide for TIME, SIDE, split boundaries, and visual order. Normally each [BUBBLE n] should become one CSV row with that TIME and SIDE, unless it is clearly UI noise. Use the image, not noisy OCR text, for final message wording.
+8. The output rows must follow the exact visible top-to-bottom order of rounded bubbles in the screenshot.
+9. If two separate rounded bubbles show the same timestamp, still output two separate rows.
 9. OCR COVERAGE CHECK: Every non-UI LEFT/RIGHT OCR text block must be represented in one output message. Do not drop lines from a bubble.
 10. If a bubble has multiple OCR lines before its timestamp, merge all those lines into the same message.
 11. Do not shorten messages. Do not keep only the first line of a bubble.
+12. If the draft has a row with obvious word-order noise, lowercase orphan fragments, or leaked neighboring bubble text, re-read the rounded bubble from the image and repair only that row/split.
 10. Emoji rule: {emoji_rule}
 12. Preserve evidence exactly: amounts, names, countries, cities, receiver details, phone numbers, account/payment details, reference numbers.
 13. Time must be the bubble's visible time, combined with VISIBLE DATE FOR THIS SCREEN. Format: "DD/MM/YYYY HH:MM".
 14. Only use times from ALLOWED BUBBLE TIMES FOR THIS SCREEN. Do not use the status bar time.
-15. Fix only obvious OCR mistakes when the image clearly supports it: Im -> I'm, Icant -> I can't, | -> I, $ -> s, trailing ":" or "_" as punctuation.
+15. Fix only obvious OCR mistakes when the image clearly supports it: Im -> I'm, Icant -> I can't, IIl/1'Il -> I'll, Ijust -> I just, Iwill -> I will, Ilove -> I love, | -> I, $ -> s, and remove leaked HH:MM tokens from message text.
 16. Do not invent, summarize, or add messages from other screenshots.
 17. Use exactly three quoted CSV fields per row. No markdown, no explanations.
 
 Final CSV:
 """
-
-
 
 def build_screen_repair_prompt(
     draft_csv: str,
@@ -779,14 +676,14 @@ Rules:
 2. Keep every real visible message bubble from this screenshot.
 3. Remove all UI rows: status bar clock, battery, header/contact, contact phone, encryption banner, date separator as message, Type a message, GIF, icons, read ticks.
 4. Side must be LEFT or RIGHT based on visible bubble position/color. Do not output names.
-5. Use VIBER BUBBLE HINTS as a guide: normally each [BUBBLE n] should become one CSV row with that TIME and SIDE, unless it is clearly UI noise.
+5. Use VIBER BUBBLE HINTS as a guide for TIME, SIDE, and split boundaries only. Normally each [BUBBLE n] should become one CSV row with that TIME and SIDE, unless it is clearly UI noise. Use the image, not noisy OCR text, for final message wording.
 6. If two separate rounded bubbles show the same timestamp, still output two separate rows.
 7. OCR COVERAGE CHECK: Every non-UI LEFT/RIGHT OCR text block must be represented in one output message.
 8. If the draft omitted an OCR line from a bubble, add it back.
 9. Do not shorten messages. Do not keep only the first line of a bubble.
 10. Emoji rule: {emoji_rule}
 11. Merge wrapped lines of the same visible bubble into one message.
-12. Use only visible bubble times listed in ALLOWED BUBBLE TIMES FOR THIS SCREEN.
+12. Use only visible bubble times listed in ALLOWED BUBBLE TIMES FOR THIS SCREEN. Remove leaked HH:MM tokens from message text; they are timestamps, not message content.
 11. Combine each time with VISIBLE DATE FOR THIS SCREEN. Format: "DD/MM/YYYY HH:MM".
 13. Preserve evidence: amounts, names, receiver details, locations, phone numbers, accounts, references.
 14. Do not invent messages and do not include messages from other screenshots.
@@ -795,16 +692,9 @@ Rules:
 Final CSV:
 """
 
-
-
 # ============================================================
 # CSV NORMALIZATION
 # ============================================================
-
-
-
-
-
 def is_ui_message(message: str) -> bool:
     """Detects platform UI text that should not become a chat row."""
     # Notes:
@@ -847,132 +737,9 @@ def is_ui_message(message: str) -> bool:
 
     return False
 
-
-
 def clean_message_text(message: str) -> str:
-    """Applies conservative OCR and punctuation cleanup to messages."""
-    # Notes:
-    # No case-specific names, phone numbers, or emoji substitutions are used here.
-    # This function only applies pattern-based OCR cleanup that is broadly useful.
-    msg = str(message or "").strip()
-
-    # CSV/quote cleanup.
-    # Convert double quotation marks inside message text to apostrophes.
-    # CSV field quoting is still handled safely by csv.writer.
-    msg = msg.replace('\\"', "'")
-    msg = msg.replace('""', "'")
-    msg = msg.replace('"', "'")
-    msg = msg.replace("“", "'")
-    msg = msg.replace("”", "'")
-    msg = msg.replace("’", "'")
-
-    # Generic OCR artifact: word+'$ usually means word+'s.
-    msg = re.sub(r"\b([A-Za-z]+)'\$", r"\1's", msg)
-
-    # Generic English contraction/OCR fixes.
-    msg = re.sub(r"\bIm\b", "I'm", msg)
-    msg = re.sub(r"\bI\s*m\b", "I'm", msg)
-    msg = re.sub(r"\bIcant\b", "I can't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIcan't\b", "I can't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bdontt\b", "don't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bdont\b", "don't", msg, flags=re.IGNORECASE)
-    msg = re.sub(r"\bIll\b", "I'll", msg)
-    msg = re.sub(r"\bI\s*ll\b", "I'll", msg)
-    msg = re.sub(r"\bIve\b", "I've", msg)
-    msg = re.sub(r"\bFve\b", "I've", msg)
-    msg = re.sub(r"\bIts\b", "It's", msg)
-    msg = re.sub(r"\bIwill\b", "I will", msg, flags=re.IGNORECASE)
-
-    # Missing first-person pronoun in common chat/OCR cases.
-    msg = re.sub(r"(?i)^see\.\.\.", "I see...", msg)
-    msg = re.sub(r"(?i)^lost my wife\b", "I lost my wife", msg)
-    msg = re.sub(r"(?i)^feel\s+(?=(so|our|the|a)\b)", "I feel ", msg)
-
-    # OCR sometimes reads final exclamation mark as lowercase l.
-    msg = re.sub(r"(?i)\blovel\b", "love!", msg)
-    msg = re.sub(r"(?i)\bangell\b", "angel!", msg)
-    msg = re.sub(r"(?i)\bMichaell\b", "Michael!", msg)
-
-    # OCR sometimes reads pronoun I as | or !. Convert only in obvious pronoun contexts.
-    msg = re.sub(
-        r"(?i)(^|[\s,.;:!?])\|\s+(am|was|will|can|cannot|can't|need|have|think|feel|want|would|could|should|do|don't|dont|almost|love|trust|promise|already|may|must|might|know|just|may)\b",
-        lambda m: f"{m.group(1)}I {m.group(2)}",
-        msg
-    )
-    msg = re.sub(
-        r"(?i)(^|[\s,.;:!?])!\s+(know|need|want|have|am|was|will|can|can't|dont|don't|feel|think|love|trust|just)\b",
-        lambda m: f"{m.group(1)}I {m.group(2)}",
-        msg
-    )
-    msg = re.sub(
-        r"(?i)\b(and|but|that|if|when|because|so)\s+\|\s+",
-        lambda m: f"{m.group(1)} I ",
-        msg
-    )
-
-    # OCR punctuation artifacts around ellipses.
-    msg = msg.replace(":_.", "...")
-    msg = msg.replace(":-", "...")
-    msg = msg.replace("_.", "...")
-    msg = msg.replace(":...", "...")
-    msg = re.sub(r"[_]{2,}", "...", msg)
-    msg = msg.replace("_", "")
-
-    # Normalize spaced ellipses.
-    msg = re.sub(r"\.\.\.\s*\.", "...", msg)
-    msg = re.sub(r"\s*\.\.\s*", "... ", msg)
-    msg = re.sub(r"\s*\.\.\.\s*", "... ", msg)
-    msg = re.sub(r"\.{4,}", "...", msg)
-
-    # Generic colon/semicolon cleanup inside normal prose.
-    # Preserve structured labels like "Name:", "Country:", "IBAN:", etc.
-    label_like = r"(name|country|city|option|account|iban|reference|mtcn|phone|email|amount|details|receiver|sender|beneficiary|bank|address|code|number)"
-    has_structured_label = re.search(rf"\b{label_like}\s*:", msg, flags=re.IGNORECASE)
-
-    if not has_structured_label:
-        # Semicolon is usually a comma in OCR chat prose.
-        msg = re.sub(r";\s+(?=(my|Michael|Mary|I|I'm|you|we|it|that|this|the|they|there|but|and|more)\b)", ", ", msg, flags=re.IGNORECASE)
-
-        # Colon as sentence separator in prose.
-        msg = re.sub(
-            r":\s+(?=(please|thank|there|the|they|i|you|he|she|we|it|this|that|and|but|because|so)\b)",
-            ". ",
-            msg,
-            flags=re.IGNORECASE
-        )
-
-    # Specific but generic recurring Viber OCR cleanups.
-    msg = re.sub(r"(?i)\bmy angel!\s+You\b", "my angel! You", msg)
-    msg = re.sub(r"(?i)\bmy love!\s+I\b", "my love! I", msg)
-    msg = re.sub(r"(?i)^Hey my love:\s*$", "Hey my love!", msg)
-    msg = re.sub(r"(?i)\bso much,\s+More\b", "so much. More", msg)
-    msg = re.sub(r"(?i)\bso much;\s+More\b", "so much. More", msg)
-    msg = re.sub(r"(?i)\bthrough this:\s*Thank you\b", "through this. Thank you", msg)
-    msg = re.sub(r"(?i)\bafter,\s*I love you\b", "after. I love you", msg)
-    msg = re.sub(r"(?i)\boption Send money to Nigeria\b", "option 'Send money to Nigeria'", msg)
-
-    # Remove accidental excessive terminal quotes caused by CSV/LLM escaping.
-    msg = re.sub(r'"{2,}$', '"', msg)
-    msg = msg.replace('"""', '"')
-
-    # Whitespace and punctuation cleanup.
-    msg = re.sub(r"\s+", " ", msg).strip()
-    msg = re.sub(r"\s+([,.;:!?])", r"\1", msg)
-    msg = re.sub(r"\.\.\.\s*\.", "...", msg)
-    msg = re.sub(r"\s+\.\.\.", "...", msg)
-
-    # Sentence-final colon artifact. Keep probable evidence/list labels.
-    if msg.endswith(":") and not re.search(rf"\b{label_like}\s*:$", msg, flags=re.IGNORECASE):
-        word_count = len(re.findall(r"\b\w+\b", msg))
-        if word_count >= 4:
-            msg = msg[:-1] + "."
-
-    return msg
-
-
-
-
-
+    """Apply minimal, generic cleanup without semantic rewriting."""
+    return conservative_clean_message_text(message)
 
 def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
     """Groups OCR blocks into timestamped bubble hints."""
@@ -1061,8 +828,6 @@ def build_ocr_bubble_groups(screen_ocr: str) -> List[Dict[str, str]]:
 
     return groups
 
-
-
 def build_viber_bubble_hints(ocr_bubble_groups: Optional[List[Dict[str, str]]]) -> str:
     """Formats Viber OCR bubble groups as prompt hints."""
     # Notes:
@@ -1080,8 +845,6 @@ def build_viber_bubble_hints(ocr_bubble_groups: Optional[List[Dict[str, str]]]) 
         )
 
     return "\n".join(lines)
-
-
 
 def infer_side_for_message_from_ocr(
     message: str,
@@ -1123,22 +886,12 @@ def infer_side_for_message_from_ocr(
 
     return best_side if best_side in {"LEFT", "RIGHT"} else None
 
-
-
-
 def normalize_for_viber_fragment(text: str) -> str:
     """Normalizes Viber text for fragment and overlap checks."""
     text = str(text or "").lower()
     text = text.replace("’", "'")
-    text = re.sub(r"\blovel\b", "love", text)
-    text = re.sub(r"\bangell\b", "angel", text)
-    text = re.sub(r"\bmichaell\b", "michael", text)
-    text = re.sub(r"\bim\b", "i m", text)
-    text = re.sub(r"\bive\b", "i ve", text)
-    text = re.sub(r"\bfve\b", "i ve", text)
     text = re.sub(r"[^a-z0-9]+", " ", text)
     return re.sub(r"\s+", " ", text).strip()
-
 
 def viber_token_overlap_score(a: str, b: str) -> float:
     """Scores Viber token overlap while preserving duplicate-token counts."""
@@ -1163,59 +916,68 @@ def viber_token_overlap_score(a: str, b: str) -> float:
 
     return overlap / max(1, min(len(a_tokens), len(b_tokens)))
 
-
 def split_message_by_ocr_bubbles(
     message: str,
     hhmm: Optional[str],
     side: str,
     ocr_bubble_groups: Optional[List[Dict[str, str]]] = None,
 ) -> List[Tuple[Optional[Dict[str, str]], str]]:
-    """Splits merged Viber rows using timestamped OCR bubble groups."""
-    # Notes:
-    # Viber bubbles have visible timestamps. If two separate bubbles share the same
-    # HH:MM, the extractor must still output two rows.
+    """Split a clearly merged Viber row using OCR bubble groups as boundaries only."""
+    # Important: OCR bubble text is noisy. We use it to detect that a split is
+    # needed, but we do not blindly replace good VLM text with raw OCR text.
     if not hhmm or not ocr_bubble_groups:
         return [(None, message)]
 
+    # Prefer same-time candidates, but also allow adjacent same-side bubbles when
+    # the draft row visibly merged text from neighboring timestamped bubbles.
     candidates = [
         g for g in ocr_bubble_groups
         if g.get("time") == hhmm and g.get("side") == side
     ]
 
+    msg_norm = normalize_for_viber_fragment(message)
+    if len(msg_norm.split()) < 9:
+        return [(None, message)]
+
+    if len(candidates) < 2:
+        # Include all same-side groups whose text is strongly represented in the row.
+        candidates = [
+            g for g in ocr_bubble_groups
+            if g.get("side") == side
+            and (
+                normalize_for_viber_fragment(str(g.get("text", ""))) in msg_norm
+                or viber_token_overlap_score(message, str(g.get("text", ""))) >= 0.86
+            )
+        ]
+
     if len(candidates) < 2:
         return [(None, message)]
 
-    msg_norm = normalize_for_viber_fragment(message)
-    if len(msg_norm.split()) < 7:
-        return [(None, message)]
-
     matches: List[Dict[str, str]] = []
-    last_pos = -1
-
     for group in candidates:
         group_text = str(group.get("text", "")).strip()
         group_norm = normalize_for_viber_fragment(group_text)
-
         if len(group_norm.split()) < 3:
             continue
-
-        pos = msg_norm.find(group_norm)
-        if pos >= 0 and pos > last_pos:
-            matches.append(group)
-            last_pos = pos
-            continue
-
-        # Fuzzy fallback for cleaned LLM text vs noisy OCR group text.
-        if viber_token_overlap_score(message, group_text) >= 0.78:
+        # High threshold: only split when the OCR group is clearly represented.
+        if group_norm in msg_norm or viber_token_overlap_score(message, group_text) >= 0.90:
             matches.append(group)
 
-    # Do not split unless at least two OCR bubble groups are clearly represented.
-    if len(matches) >= 2:
-        ordered = sorted(matches, key=lambda g: int(g.get("order", 0)))
-        return [(g, str(g.get("text", "")).strip()) for g in ordered]
+    if len(matches) < 2:
+        return [(None, message)]
 
-    return [(None, message)]
+    ordered = sorted(matches, key=lambda g: int(g.get("order", 0)))
 
+    # Prefer a clean OCR group text only if it is not visibly noisy. Otherwise
+    # keep the original VLM row unsplit rather than injecting noisy OCR text.
+    split_rows: List[Tuple[Optional[Dict[str, str]], str]] = []
+    for group in ordered:
+        group_text = str(group.get("text", "")).strip()
+        if looks_like_noisy_ocr_text(group_text):
+            return [(None, message)]
+        split_rows.append((group, group_text))
+
+    return split_rows
 
 def best_ocr_group_for_message(
     message: str,
@@ -1249,6 +1011,53 @@ def best_ocr_group_for_message(
 
     return None
 
+def repair_message_from_ocr_group_if_suspicious(
+    message: str,
+    group: Optional[Dict[str, str]],
+) -> str:
+    """Use OCR bubble text only for structurally suspicious Viber rows.
+
+    The OCR group is not a general text source. It is used only when the VLM
+    output has clear orphan/word-order artifacts and the OCR bubble appears
+    cleaner for the same visible bubble.
+    """
+    if group is None:
+        return message
+
+    msg = str(message or "").strip()
+    raw = str(group.get("text", "")).strip()
+    if not msg or not raw:
+        return message
+
+    if looks_like_noisy_ocr_text(raw):
+        return message
+
+    score = viber_token_overlap_score(msg, raw)
+    if score < 0.86:
+        return message
+
+    msg_norm = normalize_for_viber_fragment(msg)
+    raw_norm = normalize_for_viber_fragment(raw)
+    msg_words = msg_norm.split()
+    raw_words = raw_norm.split()
+    if len(msg_words) < 3 or len(raw_words) < 3:
+        return message
+
+    suspicious = (
+        bool(msg[:1].islower())
+        or bool(re.search(r"\b(they|can|the|and|but)\s+(The|I|I'm|I'll|You|We|They)\b", msg))
+        or bool(re.search(r"\b(?:I{2}l|1['’]?ll|Ijust|Iwill|Icant|yoU|sO|Ji00)\b", msg))
+    )
+    if not suspicious:
+        return message
+
+    if bool(msg[:1].islower()) and bool(raw[:1].isupper()):
+        return raw
+
+    if sorted(msg_words) == sorted(raw_words) and bool(msg[:1].islower()):
+        return raw
+
+    return message
 
 def add_missing_ocr_bubbles_to_rows(
     rows: List[Dict[str, object]],
@@ -1272,6 +1081,11 @@ def add_missing_ocr_bubbles_to_rows(
             continue
 
         if len(normalize_for_viber_fragment(raw_text).split()) < 4:
+            continue
+
+        # Do not add raw OCR as a final row if it looks noisy; this keeps OCR
+        # hints as evidence for split/time/side rather than transcript text.
+        if looks_like_noisy_ocr_text(raw_text):
             continue
 
         time_value = f"{visible_date} {hhmm}"
@@ -1304,8 +1118,6 @@ def add_missing_ocr_bubbles_to_rows(
             "message": message,
             "order": int(group.get("order", 9999)),
         })
-
-
 
 # Cleans the LLM CSV, validates times/sides, and removes UI noise.
 def normalize_side_csv(
@@ -1380,6 +1192,11 @@ def normalize_side_csv(
                 ocr_bubble_groups=ocr_bubble_groups,
             )
 
+            candidate_message = repair_message_from_ocr_group_if_suspicious(
+                message=candidate_message,
+                group=chosen_group,
+            )
+
             message_clean = clean_message_text(candidate_message)
             if emoji_mode == "omit":
                 message_clean = strip_emojis(message_clean)
@@ -1388,14 +1205,18 @@ def normalize_side_csv(
                 continue
 
             order = emitted_index
+            row_time_value = time_value
             if chosen_group is not None:
                 try:
                     order = int(chosen_group.get("order", emitted_index))
                 except Exception:
                     order = emitted_index
+                group_hhmm = str(chosen_group.get("time", "")).strip()
+                if visible_date and re.fullmatch(r"\d{2}:\d{2}", group_hhmm):
+                    row_time_value = f"{visible_date} {group_hhmm}"
 
             rows_to_write.append({
-                "time": time_value,
+                "time": row_time_value,
                 "side": side,
                 "message": message_clean,
                 "order": order,
@@ -1434,14 +1255,6 @@ def normalize_side_csv(
 
     return out.getvalue().strip() + "\n"
 
-
-
-
-
-
-# Converts LEFT/RIGHT rows into Sender/Receiver rows.
-
-
 def extract_last_date_from_side_csv(side_csv: str) -> str:
     """Returns the last DD/MM/YYYY date seen in a side CSV."""
     reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
@@ -1455,20 +1268,13 @@ def extract_last_date_from_side_csv(side_csv: str) -> str:
 
     return last_date
 
-
 # ============================================================
 # PIPELINE
 # ============================================================
-
-
-
 def write_debug_text(path: Path, content: str) -> None:
     """Writes debug text to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(str(content or ""), encoding="utf-8")
-
-
-
 
 def process_viber_image(
     image_path: str,
@@ -1642,51 +1448,64 @@ def process_viber_image(
         if dump_draft:
             write_debug_text(output_debug_dir / f"screen_{idx:02d}_draft_norm.csv", draft_norm)
 
-        print(f"-> [LLM] Repairing screen #{idx} Side CSV...")
-
-        repair_prompt = build_screen_repair_prompt(
-            draft_csv=draft_norm,
-            screen_ocr=screen_ocr,
-            screen_index=idx,
-            visible_date=visible_date,
-            default_year=default_year,
-            allowed_times=allowed_times,
-            emoji_mode=emoji_mode,
-            bubble_hints=bubble_hints,
+        expected_bubbles = len(ocr_bubble_groups) if ocr_bubble_groups else 0
+        repair_needed = side_csv_needs_repair(
+            draft_norm,
+            expected_bubble_count=expected_bubbles,
         )
 
-        if dump_draft:
-            write_debug_text(output_debug_dir / f"screen_{idx:02d}_repair_prompt.txt", repair_prompt)
+        if repair_needed:
+            print(f"-> [LLM] Repairing suspicious screen #{idx} Side CSV...")
 
-        # Repair pass catches missing bubbles and bad splits/merges.
-        repaired = ollama_chat_screen(
-            model,
-            repair_prompt,
-            crop_path,
-            use_vision=use_vision,
-        )
+            repair_prompt = build_screen_repair_prompt(
+                draft_csv=draft_norm,
+                screen_ocr=screen_ocr,
+                screen_index=idx,
+                visible_date=visible_date,
+                default_year=default_year,
+                allowed_times=allowed_times,
+                emoji_mode=emoji_mode,
+                bubble_hints=bubble_hints,
+            )
 
-        if dump_draft:
-            write_debug_text(output_debug_dir / f"screen_{idx:02d}_repair_raw.csv", repaired)
+            if dump_draft:
+                write_debug_text(output_debug_dir / f"screen_{idx:02d}_repair_prompt.txt", repair_prompt)
 
-        repaired_norm = normalize_side_csv(
-            repaired,
-            visible_date=visible_date,
-            default_year=default_year,
-            allowed_times=allowed_times,
-            emoji_mode=emoji_mode,
-            ocr_bubble_groups=ocr_bubble_groups,
-        )
+            # Repair pass is now run only for suspicious screens/rows.
+            repaired = ollama_chat_screen(
+                model,
+                repair_prompt,
+                crop_path,
+                use_vision=use_vision,
+            )
 
-        if dump_draft:
-            write_debug_text(output_debug_dir / f"screen_{idx:02d}_repair_norm.csv", repaired_norm)
+            if dump_draft:
+                write_debug_text(output_debug_dir / f"screen_{idx:02d}_repair_raw.csv", repaired)
+
+            repaired_norm = normalize_side_csv(
+                repaired,
+                visible_date=visible_date,
+                default_year=default_year,
+                allowed_times=allowed_times,
+                emoji_mode=emoji_mode,
+                ocr_bubble_groups=ocr_bubble_groups,
+            )
+
+            if dump_draft:
+                write_debug_text(output_debug_dir / f"screen_{idx:02d}_repair_norm.csv", repaired_norm)
+        else:
+            print(f"-> [LLM] Screen #{idx} looks stable; skipping repair pass.")
+            repaired_norm = ""
 
         # Keep the repaired CSV only if it stays within a sane row count.
-        chosen = choose_best_screen_side_csv(
-            draft_norm=draft_norm,
-            repaired_norm=repaired_norm,
-            allowed_times=allowed_times,
-        )
+        if repaired_norm:
+            chosen = choose_best_screen_side_csv(
+                draft_norm=draft_norm,
+                repaired_norm=repaired_norm,
+                allowed_times=allowed_times,
+            )
+        else:
+            chosen = draft_norm
 
         if dump_draft:
             chosen_source = "repaired_norm" if chosen == repaired_norm else "draft_norm"
@@ -1702,6 +1521,9 @@ def process_viber_image(
     # Merge all screen-level CSV parts before applying real names.
     merged_side_csv = merge_side_csvs(side_csv_parts)
 
+    # Generic cleanup only: adjacent near-duplicates and safe continuation fragments.
+    merged_side_csv = postprocess_side_csv_rows(merged_side_csv)
+
     if dump_draft:
         write_debug_text(output_debug_dir / "merged_side.csv", merged_side_csv)
 
@@ -1716,11 +1538,9 @@ def process_viber_image(
 
     return final_csv
 
-
 # ============================================================
 # MAIN
 # ============================================================
-
 # CLI entry point: parse arguments, run extraction, and write outputs.
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -1792,9 +1612,15 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Keep debug crops/OCR/intermediate files. Default: off.",
+    )
+
+    parser.add_argument(
         "--debug-dir",
         default=None,
-        help="Directory for crops/OCR/debug files",
+        help="Directory for crops/OCR/debug files. Implies --debug.",
     )
 
     # Standard double-dash flags.
@@ -1851,12 +1677,22 @@ if __name__ == "__main__":
     script_dir = Path(__file__).resolve().parent
     image_base = image_path.stem
 
-    debug_dir = Path(args.debug_dir) if args.debug_dir else script_dir / f"{image_base}_debug"
+    debug_requested = bool(args.debug or args.debug_dir or args.dump_ocr or args.dump_draft or args.dump_side_map)
+    debug_temp = None
+    if args.debug_dir:
+        debug_dir = Path(args.debug_dir)
+    elif debug_requested:
+        debug_dir = script_dir / f"{image_base}_debug"
+    else:
+        debug_temp = tempfile.TemporaryDirectory(prefix=f"{image_base}_extract_")
+        debug_dir = Path(debug_temp.name)
+
     output_path = Path(args.output) if args.output else script_dir / f"{image_base}_extracted.csv"
 
     langs = [x.strip() for x in args.langs.split(",") if x.strip()]
 
-    final_csv = process_viber_image(
+    try:
+        final_csv = process_viber_image(
         image_path=str(image_path),
         report_text=report_text,
         model=args.model,
@@ -1871,6 +1707,9 @@ if __name__ == "__main__":
         dump_draft=args.dump_draft,
         dump_side_map=args.dump_side_map,
     )
+    finally:
+        if debug_temp is not None:
+            debug_temp.cleanup()
 
     output_path.write_text(final_csv, encoding="utf-8-sig")
 
@@ -1878,4 +1717,5 @@ if __name__ == "__main__":
     print(final_csv)
 
     print(f"\n[SUCCESS] CSV saved to: {output_path}")
-    print(f"[DEBUG] Debug folder: {debug_dir}")
+    if debug_requested:
+        print(f"[DEBUG] Debug folder: {debug_dir}")
