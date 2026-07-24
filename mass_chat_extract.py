@@ -1,7 +1,5 @@
 """Batch orchestrator for use-case ZIP/folder inputs and chat screenshot extraction."""
 
-from __future__ import annotations
-
 import argparse
 import csv
 import glob
@@ -1214,3 +1212,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

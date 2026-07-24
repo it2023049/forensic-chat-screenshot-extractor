@@ -1138,7 +1138,7 @@ def should_merge_continuation(prev_message: str, message: str) -> bool:
     continuation_starts = {
         "and", "but", "because", "so", "that", "which", "with", "without",
         "for", "to", "of", "in", "on", "at", "by", "from", "as", "than",
-        "my", "your", "our", "their", "the", "a", "an", "better", "communication"
+        "my", "your", "our", "their", "the", "a", "an", "better"
     }
 
     # A current row after an unfinished previous row can be a wrapped line even if
@@ -1338,28 +1338,586 @@ def write_crop(path: Path, crop: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), crop)
 
+def _token_counter(text: str) -> Dict[str, int]:
+    """Builds a lowercase token counter for generic coverage scoring."""
+    counter: Dict[str, int] = {}
+    for token in normalize_message_for_similarity(text).split():
+        counter[token] = counter.get(token, 0) + 1
+    return counter
+
+def _token_overlap_ratio(a: str, b: str) -> float:
+    """Measures how much of the shorter text is covered by the other text."""
+    a_counter = _token_counter(a)
+    b_counter = _token_counter(b)
+    if not a_counter or not b_counter:
+        return 0.0
+
+    overlap = 0
+    for token, count in a_counter.items():
+        overlap += min(count, b_counter.get(token, 0))
+
+    a_total = sum(a_counter.values())
+    b_total = sum(b_counter.values())
+    return overlap / max(1, min(a_total, b_total))
+
+def _candidate_rows_for_scoring(side_csv: str) -> List[List[str]]:
+    """Returns cleaned rows used only for candidate scoring."""
+    rows: List[List[str]] = []
+    for time_value, side, message in _side_csv_rows(side_csv):
+        message = conservative_clean_message_text(message)
+        if message:
+            rows.append([time_value, side, message])
+    return rows
+
+def _bubble_groups_for_scoring(bubble_groups: Optional[List[Dict[str, str]]]) -> List[Dict[str, str]]:
+    """Filters OCR/VLM bubble hints down to transcript-like groups."""
+    if not bubble_groups:
+        return []
+
+    useful: List[Dict[str, str]] = []
+    for group in bubble_groups:
+        text = str(group.get("text", "")).strip()
+        side = str(group.get("side", "")).upper()
+        if side not in {"LEFT", "RIGHT"}:
+            continue
+        if len(normalize_message_for_similarity(text).split()) < 2:
+            continue
+        useful.append(group)
+    return useful
+
+def side_csv_bubble_coverage(
+    side_csv: str,
+    bubble_groups: Optional[List[Dict[str, str]]] = None,
+    min_overlap: float = 0.58,
+) -> Tuple[int, int, float]:
+    """Scores how many visible OCR bubble hints are represented in a side CSV.
+
+    This is a generic completeness signal. It does not rewrite transcript text and
+    it does not contain dataset-specific phrases.
+    """
+    rows = _candidate_rows_for_scoring(side_csv)
+    groups = _bubble_groups_for_scoring(bubble_groups)
+    if not groups:
+        return 0, 0, 1.0
+
+    covered = 0
+    for group in groups:
+        group_text = str(group.get("text", "")).strip()
+        group_side = str(group.get("side", "")).upper()
+        best = 0.0
+        for _, row_side, row_message in rows:
+            if group_side in {"LEFT", "RIGHT"} and row_side in {"LEFT", "RIGHT"} and group_side != row_side:
+                continue
+            best = max(best, _token_overlap_ratio(group_text, row_message))
+        if best >= min_overlap:
+            covered += 1
+
+    return covered, len(groups), covered / max(1, len(groups))
+
+def _candidate_suspicion_penalty(rows: List[List[str]]) -> int:
+    """Penalizes structurally suspicious rows without using case-specific content."""
+    penalty = 0
+    for i, row in enumerate(rows):
+        message = row[2]
+        if re.search(r"\b\d{1,2}[:.,;]\d{2}\b", message):
+            penalty += 4
+        if looks_like_orphan_fragment_message(message):
+            penalty += 3
+        if len(message) >= 240:
+            penalty += 2
+        if looks_like_noisy_ocr_text(message):
+            penalty += 2
+        if i > 0:
+            prev = rows[i - 1]
+            if prev[1] == row[1] and _same_day(prev[0], row[0]) and are_near_duplicate_messages(prev[2], message):
+                penalty += 3
+            close_time = _minutes_apart(prev[0], row[0])
+            if prev[1] == row[1] and (close_time is None or close_time <= 1) and should_merge_continuation(prev[2], message):
+                penalty += 2
+    return penalty
+
+def score_side_csv_candidate(
+    side_csv: str,
+    allowed_times: Optional[Set[str]] = None,
+    expected_bubble_count: int = 0,
+    bubble_groups: Optional[List[Dict[str, str]]] = None,
+) -> float:
+    """Returns a generic quality score for a draft/repair side CSV candidate."""
+    rows = _candidate_rows_for_scoring(side_csv)
+    if not rows:
+        return -10_000.0
+
+    allowed_times = allowed_times or set()
+    row_count = len(rows)
+    score = row_count * 2.0
+
+    if expected_bubble_count > 0:
+        count_gap = abs(row_count - expected_bubble_count)
+        score -= count_gap * 6.0
+        if row_count < expected_bubble_count:
+            score -= (expected_bubble_count - row_count) * 4.0
+
+    covered, total, coverage_ratio = side_csv_bubble_coverage(
+        side_csv,
+        bubble_groups=bubble_groups,
+    )
+    if total:
+        score += coverage_ratio * 70.0
+        score += covered * 1.5
+
+    invalid_time_count = 0
+    if allowed_times:
+        for time_value, _, _ in rows:
+            hhmm = extract_hhmm_from_full_time(time_value)
+            if hhmm and hhmm not in allowed_times:
+                invalid_time_count += 1
+    score -= invalid_time_count * 5.0
+    score -= _candidate_suspicion_penalty(rows) * 4.0
+
+    return score
+
+def _best_bubble_match_for_row(
+    row: List[str],
+    bubble_groups: Optional[List[Dict[str, str]]] = None,
+    min_overlap: float = 0.58,
+) -> Tuple[Optional[Tuple[str, int]], float]:
+    """Find the best generic OCR-bubble hint match for one side-CSV row."""
+    groups = _bubble_groups_for_scoring(bubble_groups)
+    if not groups:
+        return None, 0.0
+
+    _, row_side, row_message = row
+    best_key: Optional[Tuple[str, int]] = None
+    best_score = 0.0
+
+    for fallback_order, group in enumerate(groups):
+        group_side = str(group.get("side", "")).upper()
+        if group_side in {"LEFT", "RIGHT"} and row_side in {"LEFT", "RIGHT"} and group_side != row_side:
+            continue
+
+        score = _token_overlap_ratio(row_message, str(group.get("text", "")))
+        if score > best_score:
+            try:
+                order = int(group.get("order", fallback_order))
+            except Exception:
+                order = fallback_order
+            best_score = score
+            best_key = (group_side, order)
+
+    if best_key is not None and best_score >= min_overlap:
+        return best_key, best_score
+
+    return None, best_score
+
+def _rows_are_generic_duplicates(a: List[str], b: List[str]) -> bool:
+    """Detect duplicate candidate rows without transcript-specific phrases."""
+    if a[1] != b[1]:
+        return False
+
+    a_norm = normalize_message_for_similarity(a[2])
+    b_norm = normalize_message_for_similarity(b[2])
+    if not a_norm or not b_norm:
+        return False
+
+    if a_norm == b_norm:
+        return True
+
+    shorter, longer = sorted([a_norm, b_norm], key=len)
+    if len(shorter.split()) >= 3 and shorter in longer:
+        return True
+
+    return message_similarity_ratio(a[2], b[2]) >= 0.86
+
+def _row_has_valid_visible_time(row: List[str], allowed_times: Optional[Set[str]]) -> bool:
+    """Validate row time against visible OCR times when available."""
+    if not allowed_times:
+        return True
+    hhmm = extract_hhmm_from_full_time(row[0])
+    return bool(hhmm and hhmm in allowed_times)
+
+def merge_side_csv_candidates_additive(
+    draft_norm: str,
+    repaired_norm: str,
+    allowed_times: Optional[Set[str]] = None,
+    expected_bubble_count: int = 0,
+    bubble_groups: Optional[List[Dict[str, str]]] = None,
+) -> str:
+    """Build a conservative additive candidate from draft + repair outputs.
+
+    The draft is used as the baseline. Rows from the repair pass are added only
+    when they appear to cover a visible OCR bubble not already represented by
+    the draft, or when the row count is clearly below the expected bubble count.
+    This is a general recall-improvement step: it uses geometry/OCR bubble
+    coverage, not dataset-specific names, locations, amounts, or message text.
+    """
+    allowed_times = allowed_times or set()
+    draft_rows = [r for r in _candidate_rows_for_scoring(draft_norm) if _row_has_valid_visible_time(r, allowed_times)]
+    repair_rows = [r for r in _candidate_rows_for_scoring(repaired_norm) if _row_has_valid_visible_time(r, allowed_times)]
+
+    if not draft_rows:
+        return repaired_norm
+    if not repair_rows:
+        return draft_norm
+
+    rows: List[Tuple[int, int, Optional[Tuple[str, int]], List[str]]] = []
+    covered_bubbles: Set[Tuple[str, int]] = set()
+
+    for idx, row in enumerate(draft_rows):
+        key, _score = _best_bubble_match_for_row(row, bubble_groups=bubble_groups)
+        if key is not None:
+            covered_bubbles.add(key)
+        rows.append((0, idx, key, row))
+
+    for idx, row in enumerate(repair_rows):
+        if any(_rows_are_generic_duplicates(row, existing_row) for *_unused, existing_row in rows):
+            continue
+
+        key, match_score = _best_bubble_match_for_row(row, bubble_groups=bubble_groups)
+        suspicious = looks_like_noisy_ocr_text(row[2]) or looks_like_orphan_fragment_message(row[2])
+
+        should_add = False
+        if key is not None and key not in covered_bubbles:
+            # Add only rows that map to a previously uncovered visible bubble.
+            should_add = True
+        elif not _bubble_groups_for_scoring(bubble_groups) and expected_bubble_count > len(rows):
+            # Fallback for screenshots with no usable bubble hints: add only if
+            # the output is still below the expected bubble count.
+            should_add = not suspicious
+        elif expected_bubble_count > len(rows) and match_score >= 0.72:
+            # Conservative fallback: a strong hint match can fill an under-counted screen.
+            should_add = not suspicious
+
+        if not should_add:
+            continue
+
+        if key is not None:
+            covered_bubbles.add(key)
+        rows.append((1, idx, key, row))
+
+    if len(rows) == len(draft_rows):
+        return draft_norm
+
+    # Sort by visible bubble order when known; otherwise keep baseline/repair order.
+    rows.sort(
+        key=lambda item: (
+            item[2] is None,
+            item[2][1] if item[2] is not None else item[1],
+            item[0],
+            item[1],
+        )
+    )
+
+    out = io.StringIO()
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerow(["Time", "Side", "Message"])
+
+    emitted: List[List[str]] = []
+    for _source, _idx, _key, row in rows:
+        if any(_rows_are_generic_duplicates(row, prev) for prev in emitted):
+            continue
+        emitted.append(row)
+        writer.writerow(row)
+
+    return out.getvalue().strip() + "\n"
+
 def choose_best_screen_side_csv(
     draft_norm: str,
     repaired_norm: str,
     allowed_times: Set[str],
+    expected_bubble_count: int = 0,
+    bubble_groups: Optional[List[Dict[str, str]]] = None,
+    enable_additive: bool = True,
 ) -> str:
-    """Chooses the safer draft or repair CSV for one screen."""
-    # Notes:
-    # The repair output must not explode in row count.
+    """Choose the safest candidate using platform-appropriate generic signals.
+
+    When enable_additive is True, a third candidate is built from draft rows plus
+    repair rows that cover previously uncovered OCR bubble hints. This is useful
+    for platforms where hidden/shared timestamps make missing-bubble recovery
+    more likely. When enable_additive is False, selection is limited to the
+    conservative draft-vs-repair comparison.
+    """
     draft_count = count_data_rows(draft_norm)
     repair_count = count_data_rows(repaired_norm)
 
     if repair_count == 0 and draft_count > 0:
         return draft_norm
-
     if draft_count == 0 and repair_count > 0:
         return repaired_norm
-
-    # A screen cannot have wildly more rows than visible bubble times + some same-time messages.
-    max_reasonable = max(len(allowed_times) + 4, draft_count + 3)
-
-    if repair_count > max_reasonable:
+    if draft_count == 0 and repair_count == 0:
         return draft_norm
 
-    # Prefer repaired if reasonable.
-    return repaired_norm
+    visible_limit = expected_bubble_count if expected_bubble_count > 0 else len(allowed_times)
+    if visible_limit > 0:
+        max_reasonable = max(visible_limit + 3, draft_count + 3)
+    else:
+        max_reasonable = draft_count + 3
+
+    candidates: List[Tuple[str, str]] = [("draft", draft_norm)]
+
+    if repair_count <= max_reasonable:
+        draft_cov = side_csv_bubble_coverage(draft_norm, bubble_groups=bubble_groups)[2]
+        repair_cov = side_csv_bubble_coverage(repaired_norm, bubble_groups=bubble_groups)[2]
+        if not (repair_count <= max(1, draft_count - 2) and repair_cov <= draft_cov + 0.05):
+            candidates.append(("repair", repaired_norm))
+
+    if enable_additive:
+        additive_norm = merge_side_csv_candidates_additive(
+            draft_norm=draft_norm,
+            repaired_norm=repaired_norm,
+            allowed_times=allowed_times,
+            expected_bubble_count=expected_bubble_count,
+            bubble_groups=bubble_groups,
+        )
+        additive_count = count_data_rows(additive_norm)
+        if additive_count <= max_reasonable and additive_norm not in {draft_norm, repaired_norm}:
+            candidates.append(("additive", additive_norm))
+
+    scored: List[Tuple[float, int, str, str]] = []
+    for name, candidate in candidates:
+        score = score_side_csv_candidate(
+            candidate,
+            allowed_times=allowed_times,
+            expected_bubble_count=expected_bubble_count,
+            bubble_groups=bubble_groups,
+        )
+        scored.append((score, count_data_rows(candidate), name, candidate))
+
+    draft_score = next(score for score, _count, name, _candidate in scored if name == "draft")
+    best_score, _best_count, best_name, best_candidate = max(scored, key=lambda item: (item[0], item[1]))
+
+    # Hysteresis: do not replace the draft for tiny score changes.
+    # Additive candidates need a smaller margin because they preserve the draft
+    # and only add uncovered evidence-backed rows.
+    margin = 0.35 if best_name == "additive" else 1.0
+    if best_score >= draft_score + margin:
+        return best_candidate
+
+    return draft_norm
+
+# ============================================================
+# GENERIC TEXT-POLISH CANDIDATE GUARD
+# ============================================================
+def _raw_side_csv_rows_for_polish(side_csv: str) -> List[List[str]]:
+    """Parse Time/Side/Message rows for text-polish validation."""
+    rows: List[List[str]] = []
+    try:
+        reader = csv.reader(io.StringIO(strip_code_fences(side_csv)))
+        for row in reader:
+            if not row:
+                continue
+            if len(row) >= 3 and row[0].strip().lower() == "time":
+                continue
+            if len(row) < 3:
+                continue
+            time_value = str(row[0] or "").strip()
+            side = str(row[1] or "").strip().upper()
+            message = ",".join(row[2:]).strip() if len(row) > 3 else str(row[2] or "").strip()
+            if time_value and side in {"LEFT", "RIGHT"} and message:
+                rows.append([time_value, side, message])
+    except Exception:
+        return []
+    return rows
+
+def normalize_polished_side_csv_against_reference(
+    polished_csv: str,
+    reference_csv: str,
+    emoji_mode: str = "omit",
+) -> str:
+    """Normalize a text-polish CSV while preserving reference row structure.
+
+    The polish pass is allowed to edit only Message text. This helper keeps the
+    original Time and Side fields from the reference CSV and rejects candidates
+    whose row count does not match exactly. This protects row-level precision,
+    recall, and timestamp/side structure while still allowing generic spelling,
+    casing, apostrophe, and punctuation improvements.
+    """
+    ref_rows = _raw_side_csv_rows_for_polish(reference_csv)
+    pol_rows = _raw_side_csv_rows_for_polish(polished_csv)
+
+    if not ref_rows or len(ref_rows) != len(pol_rows):
+        return ""
+
+    out = io.StringIO()
+    writer = csv.writer(out, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerow(["Time", "Side", "Message"])
+
+    for ref, pol in zip(ref_rows, pol_rows):
+        message = conservative_clean_message_text(pol[2])
+        if emoji_mode == "omit":
+            message = strip_emojis(message)
+        if not message:
+            return ""
+        writer.writerow([ref[0], ref[1], message])
+
+    return out.getvalue().strip() + "\n"
+
+def _token_norm_for_text_guard(text: str) -> str:
+    """Normalize text for semantic-stability checks in the polish guard."""
+    text = strip_emojis(str(text or ""))
+    text = text.replace("’", "'").replace("‘", "'")
+    text = text.replace("“", '"').replace("”", '"')
+    text = text.lower()
+    # Normalize common apostrophe/no-apostrophe forms for the guard only.
+    text = re.sub(r"\bim\b", "i am", text)
+    text = re.sub(r"\bi'm\b", "i am", text)
+    text = re.sub(r"\bcant\b", "can not", text)
+    text = re.sub(r"\bcan't\b", "can not", text)
+    text = re.sub(r"\bdont\b", "do not", text)
+    text = re.sub(r"\bdon't\b", "do not", text)
+    text = re.sub(r"\byoure\b", "you are", text)
+    text = re.sub(r"\byou're\b", "you are", text)
+    text = re.sub(r"\bthats\b", "that is", text)
+    text = re.sub(r"\bthat's\b", "that is", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+def _text_guard_similarity(a: str, b: str) -> float:
+    """Return similarity after guard normalization."""
+    a_norm = _token_norm_for_text_guard(a)
+    b_norm = _token_norm_for_text_guard(b)
+    if not a_norm and not b_norm:
+        return 1.0
+    if not a_norm or not b_norm:
+        return 0.0
+    if a_norm == b_norm:
+        return 1.0
+    return SequenceMatcher(None, a_norm, b_norm).ratio()
+
+def _text_artifact_penalty(message: str) -> float:
+    """Generic penalty for OCR/punctuation artifacts, not dataset phrases."""
+    text = str(message or "")
+    penalty = 0.0
+
+    artifact_patterns = [
+        r"\bI{2}l\b",
+        r"\b1['’]?I[lI]\b",
+        r"\bTII\b",
+        r"\bJi00\b",
+        r"\bIcant\b",
+        r"\bIcan't\b",
+        r"\bIjust\b",
+        r"\bIwill\b",
+        r"\bIlove\b",
+        r"\byoU\b",
+        r"\bsO\b",
+        r"\|",
+        r"__",
+        r"=",
+        r"(?<![A-Za-z0-9])\d{1,2}[:.,;]\d{2}(?![A-Za-z0-9])",
+    ]
+    for pattern in artifact_patterns:
+        penalty += 2.0 * len(re.findall(pattern, text))
+
+    penalty += 1.0 * len(re.findall(r"\s+[,.;:!?]", text))
+    penalty += 0.5 * len(re.findall(r"[,.;:!?](?=[A-Za-z])", text))
+    penalty += 1.0 * len(re.findall(r"\.{4,}", text))
+    penalty += 1.0 * len(re.findall(r"[!?]{3,}", text))
+
+    # Unbalanced plain double quotes are often OCR/polish damage.
+    if text.count('"') % 2 == 1:
+        penalty += 1.0
+
+    words = re.findall(r"[A-Za-z']+", text)
+    if len(words) >= 4 and text[:1].islower():
+        penalty += 0.75
+
+    return penalty
+
+def _text_style_score(rows: List[List[str]]) -> float:
+    """Score generic transcript text cleanliness for polish selection."""
+    score = 0.0
+    for _time_value, _side, message in rows:
+        msg = str(message or "").strip()
+        if not msg:
+            score -= 20.0
+            continue
+        score -= _text_artifact_penalty(msg)
+        # Very noisy rows should not be preferred, but do not over-penalize
+        # ordinary informal chat without terminal punctuation.
+        if looks_like_noisy_ocr_text(msg):
+            score -= 5.0
+        if looks_like_orphan_fragment_message(msg):
+            score -= 2.0
+    return score
+
+def choose_text_polished_side_csv(
+    reference_csv: str,
+    polished_csv: str,
+    allowed_times: Optional[Set[str]] = None,
+    expected_bubble_count: int = 0,
+    bubble_groups: Optional[List[Dict[str, str]]] = None,
+    min_similarity: float = 0.82,
+) -> str:
+    """Choose a text-polished candidate only when it preserves structure.
+
+    This is a general exact-match improvement guard. It can improve absolute
+    text match by allowing the vision model to polish spelling/casing/punctuation,
+    but it refuses changes that alter the number of rows, Time/Side fields, visible
+    time validity, bubble coverage, or message semantics too much.
+    """
+    if not polished_csv:
+        return reference_csv
+
+    allowed_times = allowed_times or set()
+    ref_rows = _raw_side_csv_rows_for_polish(reference_csv)
+    pol_rows = _raw_side_csv_rows_for_polish(polished_csv)
+
+    if not ref_rows or len(ref_rows) != len(pol_rows):
+        return reference_csv
+
+    for ref, pol in zip(ref_rows, pol_rows):
+        if ref[0] != pol[0] or ref[1] != pol[1]:
+            return reference_csv
+        if allowed_times and not _row_has_valid_visible_time(pol, allowed_times):
+            return reference_csv
+
+        ref_norm = _token_norm_for_text_guard(ref[2])
+        pol_norm = _token_norm_for_text_guard(pol[2])
+        ref_words = ref_norm.split()
+        pol_words = pol_norm.split()
+
+        # For very short rows, require near-identical token content because one
+        # changed word can change the whole message.
+        if min(len(ref_words), len(pol_words)) <= 3:
+            if ref_norm != pol_norm and _text_guard_similarity(ref[2], pol[2]) < 0.92:
+                return reference_csv
+        elif _text_guard_similarity(ref[2], pol[2]) < min_similarity:
+            return reference_csv
+
+        # Avoid candidates that drastically lengthen/shorten a row.
+        ref_len = max(1, len(str(ref[2]).strip()))
+        pol_len = len(str(pol[2]).strip())
+        if pol_len < ref_len * 0.55 or pol_len > ref_len * 1.65:
+            return reference_csv
+
+        if looks_like_noisy_ocr_text(pol[2]) and not looks_like_noisy_ocr_text(ref[2]):
+            return reference_csv
+
+    ref_candidate_score = score_side_csv_candidate(
+        reference_csv,
+        allowed_times=allowed_times,
+        expected_bubble_count=expected_bubble_count,
+        bubble_groups=bubble_groups,
+    )
+    pol_candidate_score = score_side_csv_candidate(
+        polished_csv,
+        allowed_times=allowed_times,
+        expected_bubble_count=expected_bubble_count,
+        bubble_groups=bubble_groups,
+    )
+
+    # Do not sacrifice row/bubble-level quality for text polish.
+    if pol_candidate_score < ref_candidate_score - 0.25:
+        return reference_csv
+
+    ref_style = _text_style_score(ref_rows)
+    pol_style = _text_style_score(pol_rows)
+
+    # Prefer the polish when it is structurally safe and not stylistically worse.
+    # This intentionally allows punctuation/case-only improvements that may raise
+    # absolute exact match while leaving normalized/F1 metrics stable.
+    if pol_style >= ref_style - 0.25:
+        return polished_csv
+
+    return reference_csv
+

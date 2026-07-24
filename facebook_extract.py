@@ -64,6 +64,8 @@ from extractor_utils import (
     apply_side_mapping,
     write_crop,
     choose_best_screen_side_csv,
+    normalize_polished_side_csv_against_reference,
+    choose_text_polished_side_csv,
     conservative_clean_message_text,
     postprocess_side_csv_rows,
     side_csv_needs_repair,
@@ -980,6 +982,54 @@ Rules:
 17. Use exactly three quoted CSV fields per row. No markdown, no explanations.
 
 Final CSV:
+"""
+
+def build_text_polish_prompt(
+    screen_ocr: str,
+    screen_index: int,
+    visible_date: str,
+    side_csv: str,
+    emoji_mode: str,
+    bubble_hints: str = "",
+) -> str:
+    """Builds a guarded text-only polish prompt for exact-match improvement."""
+    row_count = count_data_rows(side_csv)
+    if emoji_mode == "vision":
+        emoji_rule = "Keep only emojis that are clearly visible in the screenshot; do not guess or substitute emojis."
+    else:
+        emoji_rule = "Do not include emojis. Omit emojis from Message text."
+
+    return f"""
+Polish the Message text in this Facebook Messenger side CSV using the attached screenshot as the primary source and OCR only as support.
+
+SCREEN INDEX: {screen_index}
+VISIBLE DATE: {visible_date or "unknown"}
+EXPECTED ROW COUNT: {row_count}
+
+OCR BLOCKS:
+{screen_ocr}
+
+MESSENGER BUBBLE HINTS:
+{bubble_hints or "No reliable bubble hints."}
+
+CURRENT SIDE CSV:
+{side_csv}
+
+Return only CSV with this header exactly once:
+"Time","Side","Message"
+
+Rules:
+1. Keep exactly {row_count} data rows. Do not add, remove, split, merge, reorder, or duplicate rows.
+2. Keep each row's Time and Side exactly as in CURRENT SIDE CSV.
+3. Edit only the Message field.
+4. Use the screenshot to fix only obvious OCR/casing/apostrophe/punctuation issues.
+5. Preserve the same meaning and all evidence values exactly: names, amounts, locations, phone numbers, account/payment details, reference numbers, dates, threats, and instructions.
+6. Do not paraphrase, summarize, expand abbreviations, or invent missing text.
+7. Do not change a word unless the screenshot clearly supports the correction.
+8. {emoji_rule}
+9. Use exactly three quoted CSV fields per row. No markdown, no explanations.
+
+Final polished CSV:
 """
 
 # ============================================================
@@ -2049,9 +2099,60 @@ def process_facebook_image(
                 draft_norm=draft_norm,
                 repaired_norm=repaired_norm,
                 allowed_times=allowed_times,
+                expected_bubble_count=expected_bubbles,
+                bubble_groups=messenger_bubble_groups,
+                enable_additive=True,
             )
         else:
             chosen = draft_norm
+
+        # Optional exact-text polish: same rows/times/sides, Message field only.
+        # The guard in extractor_utils.py rejects candidates that change structure,
+        # visible-time validity, bubble coverage, or message meaning too much.
+        if use_vision and count_data_rows(chosen) > 0:
+            print(f"-> [LLM] Text-polishing screen #{idx} without changing rows...")
+            polish_prompt = build_text_polish_prompt(
+                screen_ocr=screen_ocr,
+                screen_index=idx,
+                visible_date=visible_date,
+                side_csv=chosen,
+                emoji_mode=emoji_mode,
+                bubble_hints=bubble_hints,
+            )
+
+            if dump_draft:
+                (output_debug_dir / f"screen_{idx:02d}_polish_prompt.txt").write_text(
+                    polish_prompt,
+                    encoding="utf-8",
+                )
+
+            polished_raw = ollama_chat_screen(
+                model,
+                polish_prompt,
+                crop_path,
+                use_vision=use_vision,
+            )
+
+            if dump_draft:
+                (output_debug_dir / f"screen_{idx:02d}_polish_raw.csv").write_text(
+                    polished_raw,
+                    encoding="utf-8",
+                )
+
+            polished_norm = normalize_polished_side_csv_against_reference(
+                polished_raw,
+                chosen,
+                emoji_mode=emoji_mode,
+            )
+
+            if polished_norm:
+                chosen = choose_text_polished_side_csv(
+                    reference_csv=chosen,
+                    polished_csv=polished_norm,
+                    allowed_times=allowed_times,
+                    expected_bubble_count=expected_bubbles,
+                    bubble_groups=messenger_bubble_groups,
+                )
 
         if dump_draft:
             (output_debug_dir / f"screen_{idx:02d}_side.csv").write_text(
@@ -2272,3 +2373,4 @@ if __name__ == "__main__":
     print(f"\n[SUCCESS] CSV saved to: {output_path}")
     if debug_requested:
         print(f"[DEBUG] Debug folder: {debug_dir}")
+
